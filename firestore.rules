@@ -1,0 +1,14 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Clinic-wide data — any authenticated user can read/write
+    // Access control is handled at the Firebase Auth level (only invited users exist)
+    match /clinic/plessen/{document=**} {
+      allow read, write: if request.auth != null;
+    }
+    // Deny everything else
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
