@@ -1,52 +1,57 @@
 import { useState, useEffect } from "react";
-import {
-  doc, collection, onSnapshot, setDoc, getDoc,
-  writeBatch, serverTimestamp,
-} from "firebase/firestore";
+import { doc, onSnapshot, setDoc, serverTimestamp } from "firebase/firestore";
 import { db } from "./firebase.js";
 
-// ─── Clinic-wide singleton documents ─────────────────────────────────────────
-// All state lives in /clinic/plessen/{docId}
-// items     → /clinic/plessen/items        { data: [...] }
-// payers    → /clinic/plessen/payers       { data: [...] }
-// schedules → /clinic/plessen/schedules    { data: {...} }
-// settings  → /clinic/plessen/settings     { targetPct: 30 }
-
-const CLINIC_PATH = "clinic/plessen";
+// ─── Firestore structure ──────────────────────────────────────────────────────
+// Collection: "plessen"  (4 chars — valid top-level collection)
+// Documents:  "items" | "payers" | "schedules" | "settings"
+// Full paths (even segments ✓):
+//   plessen/items
+//   plessen/payers
+//   plessen/schedules
+//   plessen/settings
 
 function clinicDoc(docId) {
-  return doc(db, CLINIC_PATH, docId);
+  // doc(db, collection, document) → 2 segments = valid Firestore document ref
+  return doc(db, "plessen", docId);
 }
 
-// Generic hook: real-time listener for a clinic document that stores { data: T }
+// Real-time listener for a clinic document storing { data: T }
 export function useClinicData(docId, defaultValue) {
-  const [value, setValue]   = useState(defaultValue);
-  const [ready, setReady]   = useState(false);
+  const [value, setValue] = useState(defaultValue);
+  const [ready, setReady] = useState(false);
 
   useEffect(() => {
     const ref = clinicDoc(docId);
-    const unsub = onSnapshot(ref, (snap) => {
-      if (snap.exists()) {
-        const d = snap.data();
-        setValue(d.data ?? defaultValue);
-      } else {
-        // First run — seed with defaults
-        setDoc(ref, { data: defaultValue, updatedAt: serverTimestamp() }).catch(console.error);
+    const unsub = onSnapshot(
+      ref,
+      (snap) => {
+        if (snap.exists()) {
+          setValue(snap.data().data ?? defaultValue);
+        } else {
+          // First run — seed the document with defaults
+          setDoc(ref, { data: defaultValue, updatedAt: serverTimestamp() }).catch(console.error);
+          setValue(defaultValue);
+        }
+        setReady(true);
+      },
+      (err) => {
+        console.error(`Firestore ${docId} error:`, err);
         setValue(defaultValue);
+        setReady(true);
       }
-      setReady(true);
-    }, (err) => {
-      console.error(`Firestore ${docId} error:`, err);
-      setValue(defaultValue);
-      setReady(true);
-    });
+    );
     return () => unsub();
   }, [docId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const persist = async (newValue) => {
-    setValue(newValue);
+    setValue(newValue); // optimistic update
     try {
-      await setDoc(clinicDoc(docId), { data: newValue, updatedAt: serverTimestamp() }, { merge: true });
+      await setDoc(
+        clinicDoc(docId),
+        { data: newValue, updatedAt: serverTimestamp() },
+        { merge: true }
+      );
     } catch (err) {
       console.error(`Firestore write ${docId}:`, err);
     }
@@ -55,7 +60,7 @@ export function useClinicData(docId, defaultValue) {
   return [value, persist, ready];
 }
 
-// ─── Settings hook (flat fields, not nested data) ────────────────────────────
+// Settings hook — flat fields (targetPct stored directly, not nested under data)
 export function useSettings() {
   const [targetPct, setTargetPctState] = useState(30);
   const [ready, setReady] = useState(false);
@@ -76,7 +81,11 @@ export function useSettings() {
   const setTargetPct = async (pct) => {
     setTargetPctState(pct);
     try {
-      await setDoc(clinicDoc("settings"), { targetPct: pct, updatedAt: serverTimestamp() }, { merge: true });
+      await setDoc(
+        clinicDoc("settings"),
+        { targetPct: pct, updatedAt: serverTimestamp() },
+        { merge: true }
+      );
     } catch (err) {
       console.error("Firestore settings write:", err);
     }
