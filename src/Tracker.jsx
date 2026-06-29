@@ -273,9 +273,11 @@ function parseScheduleFile(buffer) {
 export default function App({ user, onSignOut }) {
   const [items,    setItems,    itemsReady]    = useClinicData("items",     DEFAULT_ITEMS);
   const [payers,   setPayers,   payersReady]   = useClinicData("payers",    DEFAULT_PAYERS);
-  // Each payer's schedule stored in its own Firestore doc to avoid 1MB limit
-  const PAYER_NAMES = DEFAULT_PAYERS.map(p => p.name);
-  const [schedules,setSchedules,schedReady]    = useSchedules(PAYER_NAMES, INIT_SCHEDULES);
+  // Tracked CPT codes — only these are loaded on startup for speed
+  const PAYER_NAMES   = DEFAULT_PAYERS.map(p => p.name);
+  const TRACKED_CPTS  = items.map(i => i.cptCode.toUpperCase());
+  const [schedules, setSchedules, schedReady, loadFullSchedule, writeFullUpload] =
+    useSchedules(PAYER_NAMES, INIT_SCHEDULES, TRACKED_CPTS);
   const [targetPct,setTargetPct,settingsReady]   = useSettings();
   const [selPayer, setSelPayer] = useState("Medicare");
   const [catFilter,setCatFilter]= useState("All");
@@ -314,11 +316,11 @@ export default function App({ user, onSignOut }) {
           <button onClick={()=>setShowSettings(true)} className="hdr-gear" title="Fee Schedule Manager">⚙</button>
           <div>
             <div className="hdr-title">Plessen Ophthalmology &nbsp;<span className="hdr-em">Reimbursement Tracker</span></div>
-            <div className="hdr-sub"><span className="live"/>Real fee schedules · Triple S · Aetna · ELAN · UHC · Cigna · 04/01/26</div>
+            <div className="hdr-sub"><span className="live"/>Real fee schedules  |  Triple S  |  Aetna  |  ELAN  |  UHC  |  Cigna  |  04/01/26</div>
           </div>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:14}}>
-          <div style={{fontSize:9,color:"rgba(255,255,255,.45)",lineHeight:1.8}}>Medicare CF $33.4009 · CMS-1832-F · 2026</div>
+          <div style={{fontSize:9,color:"rgba(255,255,255,.45)",lineHeight:1.8}}>Medicare CF $33.4009  |  CMS-1832-F  |  2026</div>
           <div style={{display:"flex",alignItems:"center",gap:8,borderLeft:"1px solid rgba(255,255,255,.15)",paddingLeft:14}}>
             <span style={{fontSize:9,color:"rgba(255,255,255,.6)"}}>{user?.displayName?.split(" ")[0]||user?.email}</span>
             <button onClick={onSignOut} style={{background:"rgba(255,255,255,.1)",border:"1px solid rgba(255,255,255,.2)",borderRadius:5,color:"#fff",fontSize:9,cursor:"pointer",padding:"3px 10px",fontFamily:"inherit"}}>Sign out</button>
@@ -384,7 +386,7 @@ export default function App({ user, onSignOut }) {
         })}
       </div>
 
-      {showSettings&&<FeeScheduleManager payers={payers} setPayers={setPayers} items={items} addItem={addItem} removeItem={removeItem} schedules={schedules} setSchedules={setSchedules} onClose={()=>setShowSettings(false)}/>}
+      {showSettings&&<FeeScheduleManager payers={payers} setPayers={setPayers} items={items} addItem={addItem} removeItem={removeItem} schedules={schedules} setSchedules={setSchedules} loadFullSchedule={loadFullSchedule} writeFullUpload={writeFullUpload} onClose={()=>setShowSettings(false)}/>}
       {editItem&&<EditItemModal item={editItem} payerName={selPayer} schedules={schedules} targetPct={targetPct} onSave={(id,f,v)=>updateItem(id,f,v)} onClose={()=>setEditItem(null)}/>}
     </div>
   );
@@ -462,7 +464,7 @@ function ItemCard({item,payerName,schedules,targetPct,onEdit,onRemove}) {
       <div style={{padding:"10px 12px 8px",borderBottom:"1px solid #eef4fb",background:"#f8fafd",borderRadius:"8px 8px 0 0",display:"flex",alignItems:"flex-start",justifyContent:"space-between"}}>
         <div>
           <div style={{fontSize:12,color:"#1a2d4a",fontWeight:700}}>{item.name}</div>
-          <div style={{fontSize:8,color:"#7a9ab8",marginTop:1}}>{item.cptCode} · {item.notes}</div>
+          <div style={{fontSize:8,color:"#7a9ab8",marginTop:1}}>{item.cptCode}  |  {item.notes}</div>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:5}}>
           <span className={`cbadge c-${item.category.replace(/ /g,"_")}`}>{item.category}</span>
@@ -552,7 +554,7 @@ function EditItemModal({item,payerName,schedules,targetPct,onSave,onClose}) {
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:18}}>
           <div>
             <div style={{fontFamily:"'Libre Baskerville',serif",fontSize:16,color:"#1a2d4a"}}>Edit Item</div>
-            <div style={{fontSize:9,color:"#7a9ab8",marginTop:2}}>{item.name} · {item.cptCode}</div>
+            <div style={{fontSize:9,color:"#7a9ab8",marginTop:2}}>{item.name}  |  {item.cptCode}</div>
           </div>
           <button onClick={onClose} style={{background:"#c0392b",border:"none",borderRadius:6,color:"#fff",fontSize:16,fontWeight:700,cursor:"pointer",width:32,height:32,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,lineHeight:1}}>×</button>
         </div>
@@ -600,7 +602,7 @@ function EditItemModal({item,payerName,schedules,targetPct,onSave,onClose}) {
 }
 
 // ─── FEE SCHEDULE MANAGER ────────────────────────────────────────────────────
-function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules,setSchedules,onClose}) {
+function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules,setSchedules,loadFullSchedule,writeFullUpload,onClose}) {
   const [tab,       setTab]        = useState("schedules");
   const [activePyr, setActivePyr]  = useState(payers.find(p=>p.hasSchedule)||payers[0]);
   const [search,    setSearch]     = useState("");
@@ -609,6 +611,8 @@ function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules
   const [editCell,  setEditCell]   = useState(null);
   const [editVal,   setEditVal]    = useState("");
   const [localSched,setLocalSched] = useState(()=>JSON.parse(JSON.stringify(schedules)));
+  // Keep localSched in sync when schedules prop updates (e.g. after upload)
+  useEffect(()=>{ setLocalSched(JSON.parse(JSON.stringify(schedules))); },[schedules]);
   const [dirty,     setDirty]      = useState(false);
   const [viewParsed, setViewParsed]= useState(null);  // payer to view parsed data
   const [newItem,   setNewItem]    = useState({name:"",cptCode:"",category:"Injectable",ourCost:0,medicarerate:0,billingUnits:1,notes:""});
@@ -650,43 +654,38 @@ function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules
 
   const handleUpload=(e)=>{
     const file=e.target.files?.[0]; if(!file) return;
-    // Reset input so same file can be re-uploaded
     e.target.value = "";
-    setUploading(true); setUploadMsg(""); setUploadParsed(null);
+    setUploading(true); setUploadMsg("Parsing file…"); setUploadParsed(null);
     const reader = new FileReader();
-    reader.onload = (ev) => {
+    reader.onload = async (ev) => {
       try {
         const buffer = ev.target.result;
         const parsed = parseScheduleFile(buffer);
-        if (parsed && Object.keys(parsed).length > 0) {
-          const now = new Date().toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"2-digit"});
-          const count = Object.keys(parsed).length;
-          // Merge into local copy (for immediate display in FSM)
-          const updatedSched = (prev) => ({...prev, [activePyr.name]: {...(prev[activePyr.name]||{}), ...parsed}});
-          setLocalSched(updatedSched);
-          // ALSO persist to Firestore immediately so main view updates too
-          setSchedules(prev => {
-            const next = {...prev, [activePyr.name]: {...(prev[activePyr.name]||{}), ...parsed}};
-            return next;
-          });
-          // Update payer metadata (lastUpdated, hasSchedule, uploadedFile)
-          setPayers(prev => prev.map(p =>
-            p.id === activePyr.id
-              ? {...p, lastUpdated:now, hasSchedule:true, uploadedFile:file.name}
-              : p
-          ));
-          setUploadParsed(parsed);
-          setUploadMsg(`✓ Parsed and saved ${count} CPT codes from "${file.name}" — rates are now live in the tracker.`);
-          setDirty(false); // already saved to Firestore, no manual save needed
-        } else {
-          setUploadMsg(`⚠ Could not find CPT codes and rates in "${file.name}". The file may use unexpected column names. Try opening it in Excel, exporting as CSV, and uploading that instead.`);
+        if (!parsed || Object.keys(parsed).length === 0) {
+          setUploadMsg(`⚠ Could not find CPT codes and rates in "${file.name}". Try exporting as CSV from Excel.`);
+          setUploading(false);
+          return;
         }
+        const totalCount = Object.keys(parsed).length;
+        setUploadMsg(`Parsed ${totalCount} codes — saving to Firestore…`);
+        // writeFullUpload: chunks the full schedule, saves to Firestore,
+        // and updates active_rates (lean) so FSM and cards stay in sync
+        const result = await writeFullUpload(activePyr.name, parsed);
+        const now = new Date().toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"2-digit"});
+        setPayers(prev => prev.map(p =>
+          p.id === activePyr.id
+            ? {...p, lastUpdated:now, hasSchedule:true, uploadedFile:file.name}
+            : p
+        ));
+        // localSched will sync automatically via the useEffect above
+        setUploadParsed(parsed);
+        setUploadMsg(`✓ Saved ${result.total} codes in ${result.chunks} chunk(s). ${result.tracked} match tracked items — rates updated live.`);
+        setDirty(false);
       } catch(err) {
-        setUploadMsg("✗ Parse error: " + err.message);
+        setUploadMsg("✗ Error: " + err.message);
       }
       setUploading(false);
     };
-    // Read as ArrayBuffer so SheetJS can handle XLS, XLSX, and CSV
     reader.readAsArrayBuffer(file);
   };
 
@@ -718,7 +717,7 @@ function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules
           <button onClick={onClose} style={{background:"rgba(255,255,255,.1)",border:"1px solid rgba(255,255,255,.2)",borderRadius:5,color:"#fff",fontSize:11,cursor:"pointer",padding:"4px 12px",fontFamily:"inherit"}}>← Back</button>
           <div>
             <div style={{fontFamily:"'Libre Baskerville',serif",fontSize:17,color:"#fff"}}>⚙ Fee Schedule Manager</div>
-            <div style={{fontSize:8,color:"rgba(255,255,255,.55)",letterSpacing:".06em",textTransform:"uppercase",marginTop:1}}>View · Edit · Add Items · Upload · Compare · Download</div>
+            <div style={{fontSize:8,color:"rgba(255,255,255,.55)",letterSpacing:".06em",textTransform:"uppercase",marginTop:1}}>View  |  Edit  |  Add Items  |  Upload  |  Compare  |  Download</div>
           </div>
         </div>
         <div style={{display:"flex",gap:8,alignItems:"center"}}>
@@ -769,7 +768,7 @@ function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules
           <div style={{padding:"7px 20px",background:"#fff",borderBottom:"1px solid #dce8f4",display:"flex",gap:8,flexWrap:"wrap",alignItems:"center",flexShrink:0}}>
             <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search CPT or name…" style={{padding:"4px 9px",fontSize:10,borderRadius:3,background:"#f8fafd",color:"#1a2d4a",border:"1px solid #dce8f4",outline:"none",fontFamily:"inherit",width:160}}/>
             {["All",...CATEGORIES].map(c=><button key={c} onClick={()=>setCatF(c)} style={{padding:"2px 8px",borderRadius:3,border:"1px solid",borderColor:catF===c?"#1e4080":"#dce8f4",background:catF===c?"#1e4080":"#fff",color:catF===c?"#fff":"#7a9ab8",fontSize:8,cursor:"pointer",fontFamily:"inherit"}}>{c}</button>)}
-            <span style={{fontSize:8,color:"#7a9ab8",marginLeft:"auto"}}>{sorted.length} codes · click rate to edit · ✎ units also editable</span>
+            <span style={{fontSize:8,color:"#7a9ab8",marginLeft:"auto"}}>{sorted.length} codes  |  click rate to edit  |  ✎ units also editable</span>
           </div>
 
           {/* Table */}
@@ -877,7 +876,7 @@ function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules
                         {onSch
                           ? <>
                               <div style={{fontSize:12,fontWeight:700,color:"#1a7040",marginTop:2}}>${Number(entry.rate||0).toFixed(2)}</div>
-                              <div style={{fontSize:8,color:"#7a9ab8"}}>${Number(perUnit||0).toFixed(2)}/unit · {entry.units} unit{entry.units!==1?"s":""}</div>
+                              <div style={{fontSize:8,color:"#7a9ab8"}}>${Number(perUnit||0).toFixed(2)}/unit  |  {entry.units} unit{entry.units!==1?"s":""}</div>
                             </>
                           : <div style={{fontSize:8,color:"#c03020",marginTop:2}}>★ {rule?.label||"Unpriced"}</div>
                         }
@@ -923,7 +922,7 @@ function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules
               onMouseLeave={e=>{e.currentTarget.style.borderColor="#a8c0e0";e.currentTarget.style.background="#f8fafd";}}>
               <div style={{fontSize:32,marginBottom:8}}>{uploading?"⏳":"📤"}</div>
               <div style={{fontSize:12,color:"#1a2d4a",fontWeight:600}}>{uploading?"Parsing…":"Click to upload fee schedule (CSV)"}</div>
-              <div style={{fontSize:9,color:"#7a9ab8",marginTop:4}}>CSV preferred · Expects "Code" and "Fee" columns · for {activePyr?.name}</div>
+              <div style={{fontSize:9,color:"#7a9ab8",marginTop:4}}>CSV preferred  |  Expects "Code" and "Fee" columns  |  for {activePyr?.name}</div>
               <input ref={fileRef} type="file" accept=".csv,.xls,.xlsx,.txt" style={{display:"none"}} onChange={handleUpload}/>
             </div>
             {uploadMsg&&(
@@ -941,13 +940,19 @@ function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules
       {compareOpen&&<CompareModal payers={payers} items={items} schedules={localSched} targetPct={30} onClose={()=>setCompareOpen(false)}/>}
 
       {/* View Parsed modal */}
-      {viewParsed&&<ViewParsedModal payer={viewParsed} schedule={schedules[viewParsed.name]||localSched[viewParsed.name]||{}} items={items} onClose={()=>setViewParsed(null)}/>}
+      {viewParsed&&<ViewParsedModal payer={viewParsed} items={items} loadFullSchedule={loadFullSchedule} onClose={()=>setViewParsed(null)}/>}
     </div>
   );
 }
 
 // ─── VIEW PARSED MODAL ────────────────────────────────────────────────────────
-function ViewParsedModal({payer,schedule,items,onClose}) {
+function ViewParsedModal({payer,items,loadFullSchedule,onClose}) {
+  const [schedule, setSchedule] = useState({});
+  const [loading,  setLoading]  = useState(true);
+  useEffect(()=>{
+    setLoading(true);
+    loadFullSchedule(payer.name).then(full=>{setSchedule(full);setLoading(false);}).catch(()=>setLoading(false));
+  },[payer.name]); // eslint-disable-line
   const cptInfo={}; items.forEach(i=>{cptInfo[i.cptCode.toUpperCase()]=i;});
   const entries=Object.entries(schedule).sort((a,b)=>a[0].localeCompare(b[0]));
   return (
@@ -956,12 +961,19 @@ function ViewParsedModal({payer,schedule,items,onClose}) {
         <div style={{background:"linear-gradient(135deg,#1a3a6a,#1e4080)",padding:"12px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>
           <div>
             <div style={{fontFamily:"'Libre Baskerville',serif",fontSize:16,color:"#fff"}}>👁 Parsed Schedule — {payer.name}</div>
-            <div style={{fontSize:8,color:"rgba(255,255,255,.6)",marginTop:2}}>View only · {entries.length} codes loaded · Last updated: {payer.lastUpdated||"—"}</div>
+            <div style={{fontSize:8,color:"rgba(255,255,255,.6)",marginTop:2}}>View only  |  {entries.length} codes loaded  |  Last updated: {payer.lastUpdated||"—"}</div>
           </div>
           <button onClick={onClose} style={{background:"#c0392b",border:"none",borderRadius:6,color:"#fff",fontSize:16,fontWeight:700,cursor:"pointer",width:32,height:32,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,lineHeight:1}}>×</button>
         </div>
         {payer.uploadedFile&&<div style={{background:"#f4f8fd",padding:"8px 20px",fontSize:9,color:"#7a9ab8",borderBottom:"1px solid #dce8f4",flexShrink:0}}>📁 Source file: <strong style={{color:"#1a2d4a"}}>{payer.uploadedFile}</strong></div>}
         <div style={{flex:1,overflowY:"auto"}}>
+          {loading ? (
+            <div style={{textAlign:"center",padding:"40px 0",color:"#7a9ab8",fontSize:12}}>
+              <div style={{fontSize:24,marginBottom:8,display:"inline-block",animation:"spin 1.2s linear infinite"}}>⟳</div>
+              <div>Loading full schedule…</div>
+              <style>{"@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}"}</style>
+            </div>
+          ) : (
           <table style={{borderCollapse:"collapse",width:"100%"}}>
             <thead>
               <tr>
@@ -987,9 +999,10 @@ function ViewParsedModal({payer,schedule,items,onClose}) {
               })}
             </tbody>
           </table>
+          )}
         </div>
         <div style={{padding:"10px 20px",background:"#e8f0fa",borderTop:"1px solid #dce8f4",fontSize:9,color:"#7a9ab8",flexShrink:0}}>
-          This is a view-only snapshot. Edit rates in the Fee Schedules tab.
+          {loading ? "Loading…" : (entries.length + " codes  |  view-only  |  edit rates in the Fee Schedules tab")}
         </div>
       </div>
     </div>
