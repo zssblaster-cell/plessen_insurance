@@ -5,7 +5,6 @@ import {
 } from "firebase/firestore";
 import { db } from "./firebase.js";
 
-// ─── Constants ────────────────────────────────────────────────────────────────
 const MAX_ENTRIES_PER_CHUNK = 400;
 const MAX_BYTES_PER_CHUNK   = 700_000;
 
@@ -17,21 +16,17 @@ function chunkDocId(payerName, idx) {
   return "sched_" + payerName.toLowerCase().replace(/[\s/]+/g, "_") + "_" + idx;
 }
 
-// ─── Chunk helpers ────────────────────────────────────────────────────────────
 export function chunkSchedule(scheduleObj) {
-  const entries = Object.entries(scheduleObj);
-  const chunks  = [];
+  const entries = Object.entries(scheduleObj || {});
+  const chunks = [];
   let cur = {}, curBytes = 0;
-
   for (const [cpt, val] of entries) {
     const bytes = JSON.stringify({ [cpt]: val }).length;
     if ((curBytes + bytes > MAX_BYTES_PER_CHUNK || Object.keys(cur).length >= MAX_ENTRIES_PER_CHUNK)
         && Object.keys(cur).length > 0) {
-      chunks.push(cur);
-      cur = {}; curBytes = 0;
+      chunks.push(cur); cur = {}; curBytes = 0;
     }
-    cur[cpt] = val;
-    curBytes += bytes;
+    cur[cpt] = val; curBytes += bytes;
   }
   if (Object.keys(cur).length > 0) chunks.push(cur);
   return chunks;
@@ -62,12 +57,8 @@ export function useClinicData(docId, defaultValue) {
 
   useEffect(() => {
     const unsub = onSnapshot(clinicDoc(docId), snap => {
-      if (snap.exists()) {
-        setValue(snap.data().data ?? defaultValue);
-      } else {
-        setDoc(clinicDoc(docId), { data: defaultValue, updatedAt: serverTimestamp() }).catch(console.error);
-        setValue(defaultValue);
-      }
+      if (snap.exists()) setValue(snap.data().data ?? defaultValue);
+      else { setDoc(clinicDoc(docId), { data: defaultValue, updatedAt: serverTimestamp() }).catch(console.error); setValue(defaultValue); }
       setReady(true);
     }, err => { console.error(`Firestore ${docId}:`, err); setValue(defaultValue); setReady(true); });
     return () => unsub();
@@ -84,147 +75,74 @@ export function useClinicData(docId, defaultValue) {
   return [value, setData, ready];
 }
 
-// ─── Lean active-rates hook ───────────────────────────────────────────────────
-// On startup: only loads rates for CPT codes actually in `trackedCpts`.
-// Full chunks are loaded on-demand via loadFullSchedule().
+// ─── Schedules hook ──────────────────────────────────────────────────────────
 //
 // Firestore layout:
-//   plessen/sched_index   → { payerName: ["docId0","docId1",...], ... }
-//   plessen/sched_*_0     → { data: { CPT: {rate,units} } }
-//   plessen/active_rates  → { payerName: { CPT: {rate,units} } }  ← fast-load doc
+//   plessen/active_rates  → { payerName: { CPT: {rate,units} }, ... }
+//                           Only contains CPT codes tracked in items.
+//                           This is what the app reads on startup and in real time.
+//                           Updated whenever a file is uploaded.
+//
+//   plessen/sched_index   → { payerName: ["sched_triple_s_0", ...] }
+//   plessen/sched_*_N     → { data: { CPT: {rate,units} } }  (full schedule chunks)
+//                           Only fetched on-demand (View Parsed).
+//
+// Key design:
+//   - active_rates has an onSnapshot listener → any write to it updates the UI instantly
+//   - writeFullUpload writes chunks first, then writes active_rates → triggers the listener
+//   - No INIT_SCHEDULES seeding — if active_rates is empty for a payer, that payer
+//     shows as unpriced until a file is uploaded
 
-export function useSchedules(payerNames, initSchedules, trackedCpts) {
-  // schedules = lean view: only tracked CPTs (used by cards + FSM rate display)
-  const [schedules,    setSchedulesState] = useState(() => {
-    const s = {};
-    payerNames.forEach(p => { s[p] = {}; });
-    return s;
+export function useSchedules(payerNames) {
+  const [schedules,  setSchedulesState] = useState(() => {
+    const s = {}; payerNames.forEach(p => { s[p] = {}; }); return s;
   });
-  const [ready,        setReady]    = useState(false);
-  const indexRef       = useRef({});   // { payerName: [docId, ...] }
-  const fullCacheRef   = useRef({});   // { payerName: fullScheduleObj } — populated lazily
+  const [ready, setReady] = useState(false);
+  const indexRef     = useRef({});
+  const fullCacheRef = useRef({});
 
-  // ── Startup: load active_rates doc (lean, fast) then seed if missing ────────
+  // ── Real-time listener on active_rates ────────────────────────────────────
   useEffect(() => {
-    let cancelled = false;
-
-    async function init() {
-      try {
-        // 1. Read index
-        const idxSnap = await getDoc(clinicDoc("sched_index"));
-        const index   = idxSnap.exists() ? idxSnap.data() : {};
-        indexRef.current = index;
-
-        // 2. Read active_rates (fast path — just tracked CPTs)
-        const arSnap = await getDoc(clinicDoc("active_rates"));
-
-        if (arSnap.exists() && Object.keys(arSnap.data()).some(k => payerNames.includes(k))) {
-          // Active rates exist — use them directly
-          if (!cancelled) {
-            const ar = arSnap.data();
-            setSchedulesState(ar);
-            setReady(true);
-          }
-        } else {
-          // First run — seed from initSchedules for tracked CPTs only
-          const seedBatch  = writeBatch(db);
-          const newIndex   = { ...index };
-          const activeRates = {};
-
-          for (const payerName of payerNames) {
-            const full = initSchedules[payerName] || {};
-            // Write full chunks
-            const chunks = chunkSchedule(full);
-            const docIds = chunks.map((_, i) => chunkDocId(payerName, i));
-            chunks.forEach((chunk, i) => {
-              seedBatch.set(clinicDoc(docIds[i]), { data: chunk, updatedAt: serverTimestamp() });
-            });
-            newIndex[payerName] = docIds;
-
-            // Extract only tracked CPTs for active_rates
-            const lean = {};
-            trackedCpts.forEach(cpt => {
-              const cptU = cpt.toUpperCase();
-              if (full[cptU]) lean[cptU] = full[cptU];
-            });
-            activeRates[payerName] = lean;
-          }
-
-          seedBatch.set(clinicDoc("sched_index"),   { ...newIndex,   updatedAt: serverTimestamp() });
-          seedBatch.set(clinicDoc("active_rates"),   { ...activeRates, updatedAt: serverTimestamp() });
-          await seedBatch.commit();
-          indexRef.current = newIndex;
-
-          if (!cancelled) {
-            setSchedulesState(activeRates);
-            setReady(true);
-          }
+    const unsub = onSnapshot(
+      clinicDoc("active_rates"),
+      (snap) => {
+        if (snap.exists()) {
+          const data = snap.data();
+          // Merge into per-payer structure, strip updatedAt
+          const merged = {};
+          payerNames.forEach(p => { merged[p] = data[p] || {}; });
+          setSchedulesState(merged);
         }
-      } catch (err) {
-        console.error("useSchedules init error:", err);
-        if (!cancelled) {
-          // Fall back to init schedules for tracked codes
-          const fallback = {};
-          payerNames.forEach(p => {
-            const full = initSchedules[p] || {};
-            const lean = {};
-            trackedCpts.forEach(cpt => {
-              const u = cpt.toUpperCase();
-              if (full[u]) lean[u] = full[u];
-            });
-            fallback[p] = lean;
-          });
-          setSchedulesState(fallback);
-          setReady(true);
-        }
+        // If doc doesn't exist yet that's fine — stays empty until upload
+        setReady(true);
+      },
+      (err) => {
+        console.error("active_rates listener:", err);
+        setReady(true);
       }
-    }
-
-    init();
-    return () => { cancelled = true; };
+    );
+    return () => unsub();
   }, []); // eslint-disable-line
 
-  // ── setSchedules: update lean view + persist active_rates + re-chunk full ──
+  // ── setSchedules: for manual edits in FSM ─────────────────────────────────
+  // Writes only the changed payers' entries to active_rates
   const setSchedules = useCallback((updaterOrValue) => {
     setSchedulesState(prev => {
       const next = typeof updaterOrValue === "function" ? updaterOrValue(prev) : updaterOrValue;
-
-      // Persist active_rates and re-chunk changed payers
       const changedPayers = payerNames.filter(p => next[p] !== prev[p]);
       if (changedPayers.length === 0) return next;
 
       (async () => {
         try {
-          const batch    = writeBatch(db);
-          const newIndex = { ...indexRef.current };
-
-          for (const payerName of changedPayers) {
-            const data = next[payerName] || {};
-
-            // Re-chunk the full data for this payer
-            // If we have a full cache use that merged with changes, else just use data
-            const fullData = fullCacheRef.current[payerName]
-              ? { ...fullCacheRef.current[payerName], ...data }
-              : data;
-
-            const chunks = chunkSchedule(fullData);
-            const docIds = chunks.map((_, i) => chunkDocId(payerName, i));
-            chunks.forEach((chunk, i) => {
-              batch.set(clinicDoc(docIds[i]), { data: chunk, updatedAt: serverTimestamp() });
-            });
-            newIndex[payerName] = docIds;
-
-            // Update full cache ref
-            fullCacheRef.current[payerName] = fullData;
-          }
-
-          // Update index and active_rates
-          batch.set(clinicDoc("sched_index"),  { ...newIndex, updatedAt: serverTimestamp() });
-          batch.set(clinicDoc("active_rates"), { ...next,     updatedAt: serverTimestamp() });
-          await batch.commit();
-          indexRef.current = newIndex;
+          // Read current active_rates, merge changed payers, write back
+          const arSnap = await getDoc(clinicDoc("active_rates"));
+          const existing = arSnap.exists() ? arSnap.data() : {};
+          const update = { ...existing, updatedAt: serverTimestamp() };
+          changedPayers.forEach(p => { update[p] = next[p] || {}; });
+          await setDoc(clinicDoc("active_rates"), update, { merge: true });
+          // onSnapshot listener will pick this up and update state automatically
         } catch (err) {
-          console.error("setSchedules write error:", err);
+          console.error("setSchedules write:", err);
         }
       })();
 
@@ -232,16 +150,68 @@ export function useSchedules(payerNames, initSchedules, trackedCpts) {
     });
   }, [payerNames]); // eslint-disable-line
 
-  // ── loadFullSchedule: on-demand — used only by ViewParsedModal ───────────────
-  const loadFullSchedule = useCallback(async (payerName) => {
-    // Return from cache if available
-    if (fullCacheRef.current[payerName]) return fullCacheRef.current[payerName];
-
+  // ── writeFullUpload: called after file parse ───────────────────────────────
+  // 1. Chunk and save the full schedule
+  // 2. Extract tracked CPTs → write to active_rates
+  // 3. onSnapshot fires → schedules state updates instantly in UI
+  const writeFullUpload = useCallback(async (payerName, fullParsed, trackedCpts) => {
     try {
-      const docIds    = indexRef.current[payerName] || [];
+      // Step 1: chunk the full schedule
+      const chunks = chunkSchedule(fullParsed);
+      const docIds = chunks.map((_, i) => chunkDocId(payerName, i));
+      const batch  = writeBatch(db);
+      chunks.forEach((chunk, i) => {
+        batch.set(clinicDoc(docIds[i]), { data: chunk, updatedAt: serverTimestamp() });
+      });
+
+      // Step 2: update the index
+      const idxSnap  = await getDoc(clinicDoc("sched_index"));
+      const newIndex = { ...(idxSnap.exists() ? idxSnap.data() : {}), [payerName]: docIds };
+      batch.set(clinicDoc("sched_index"), { ...newIndex, updatedAt: serverTimestamp() });
+
+      // Step 3: extract tracked CPTs and write to active_rates
+      // trackedCpts is passed in fresh from the caller so it's always current
+      const lean = {};
+      const cptSet = new Set(trackedCpts.map(c => c.toUpperCase()));
+      Object.entries(fullParsed).forEach(([cpt, val]) => {
+        if (cptSet.has(cpt.toUpperCase())) lean[cpt.toUpperCase()] = val;
+      });
+
+      // Read current active_rates and merge
+      const arSnap   = await getDoc(clinicDoc("active_rates"));
+      const existing = arSnap.exists() ? arSnap.data() : {};
+      const newAr    = { ...existing, [payerName]: lean, updatedAt: serverTimestamp() };
+      batch.set(clinicDoc("active_rates"), newAr);
+
+      await batch.commit();
+
+      // Update refs
+      indexRef.current = newIndex;
+      fullCacheRef.current[payerName] = fullParsed;
+
+      // onSnapshot on active_rates will fire automatically and update schedules state
+      console.log(`✓ ${payerName}: ${chunks.length} chunk(s), ${Object.keys(fullParsed).length} total codes, ${Object.keys(lean).length} tracked`);
+
+      return {
+        chunks: chunks.length,
+        total:   Object.keys(fullParsed).length,
+        tracked: Object.keys(lean).length,
+      };
+    } catch (err) {
+      console.error(`writeFullUpload ${payerName}:`, err);
+      throw err;
+    }
+  }, []); // eslint-disable-line
+
+  // ── loadFullSchedule: on-demand, only for View Parsed ─────────────────────
+  const loadFullSchedule = useCallback(async (payerName) => {
+    if (fullCacheRef.current[payerName]) return fullCacheRef.current[payerName];
+    try {
+      const idxSnap = await getDoc(clinicDoc("sched_index"));
+      const docIds  = idxSnap.exists() ? (idxSnap.data()[payerName] || []) : [];
       if (docIds.length === 0) return {};
-      const snaps     = await Promise.all(docIds.map(id => getDoc(clinicDoc(id))));
-      const full      = stitchChunks(snaps.map(s => s.exists() ? (s.data().data || {}) : {}));
+      const snaps = await Promise.all(docIds.map(id => getDoc(clinicDoc(id))));
+      const full  = stitchChunks(snaps.map(s => s.exists() ? (s.data().data || {}) : {}));
       fullCacheRef.current[payerName] = full;
       return full;
     } catch (err) {
@@ -249,47 +219,6 @@ export function useSchedules(payerNames, initSchedules, trackedCpts) {
       return {};
     }
   }, []);
-
-  // ── writeFullUpload: called after parse — writes chunks + updates active_rates
-  const writeFullUpload = useCallback(async (payerName, fullParsed) => {
-    try {
-      const chunks   = chunkSchedule(fullParsed);
-      const docIds   = chunks.map((_, i) => chunkDocId(payerName, i));
-      const batch    = writeBatch(db);
-
-      chunks.forEach((chunk, i) => {
-        batch.set(clinicDoc(docIds[i]), { data: chunk, updatedAt: serverTimestamp() });
-      });
-
-      const newIndex = { ...indexRef.current, [payerName]: docIds };
-      batch.set(clinicDoc("sched_index"), { ...newIndex, updatedAt: serverTimestamp() });
-
-      // Extract only tracked CPTs for active_rates
-      const lean = {};
-      trackedCpts.forEach(cpt => {
-        const u = cpt.toUpperCase();
-        if (fullParsed[u]) lean[u] = fullParsed[u];
-      });
-
-      // Update active_rates for this payer
-      const arSnap = await getDoc(clinicDoc("active_rates"));
-      const existing = arSnap.exists() ? arSnap.data() : {};
-      const newAr = { ...existing, [payerName]: lean, updatedAt: serverTimestamp() };
-      batch.set(clinicDoc("active_rates"), newAr);
-
-      await batch.commit();
-      indexRef.current = newIndex;
-      fullCacheRef.current[payerName] = fullParsed;
-
-      // Update local state with the lean view
-      setSchedulesState(prev => ({ ...prev, [payerName]: lean }));
-
-      return { chunks: chunks.length, total: Object.keys(fullParsed).length, tracked: Object.keys(lean).length };
-    } catch (err) {
-      console.error(`writeFullUpload ${payerName}:`, err);
-      throw err;
-    }
-  }, [trackedCpts]); // eslint-disable-line
 
   return [schedules, setSchedules, ready, loadFullSchedule, writeFullUpload];
 }

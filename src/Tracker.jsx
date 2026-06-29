@@ -308,11 +308,12 @@ function parseScheduleFile(buffer) {
 export default function App({ user, onSignOut }) {
   const [items,    setItems,    itemsReady]    = useClinicData("items",     DEFAULT_ITEMS);
   const [payers,   setPayers,   payersReady]   = useClinicData("payers",    DEFAULT_PAYERS);
-  // Tracked CPT codes — only these are loaded on startup for speed
-  const PAYER_NAMES   = DEFAULT_PAYERS.map(p => p.name);
-  const TRACKED_CPTS  = items.map(i => i.cptCode.toUpperCase());
+  // Only tracked CPT codes are loaded on startup for speed
+  const PAYER_NAMES  = DEFAULT_PAYERS.map(p => p.name);
+  // TRACKED_CPTS rebuilt fresh on each render so writeFullUpload always gets current list
+  const TRACKED_CPTS = items.map(i => i.cptCode.toUpperCase());
   const [schedules, setSchedules, schedReady, loadFullSchedule, writeFullUpload] =
-    useSchedules(PAYER_NAMES, INIT_SCHEDULES, TRACKED_CPTS);
+    useSchedules(PAYER_NAMES);
   const [targetPct,setTargetPct,settingsReady]   = useSettings();
   const [selPayer, setSelPayer] = useState("Medicare");
   const [catFilter,setCatFilter]= useState("All");
@@ -706,7 +707,9 @@ function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules
         setUploadMsg(`Parsed ${totalCount} codes — saving to Firestore…`);
         // writeFullUpload: chunks the full schedule, saves to Firestore,
         // and updates active_rates (lean) so FSM and cards stay in sync
-        const result = await writeFullUpload(activePyr.name, parsed);
+        // Pass current TRACKED_CPTS so writeFullUpload has the live item list
+        const currentCpts = items.map(i => i.cptCode.toUpperCase());
+        const result = await writeFullUpload(activePyr.name, parsed, currentCpts);
         const now = new Date().toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"2-digit"});
         setPayers(prev => prev.map(p =>
           p.id === activePyr.id
