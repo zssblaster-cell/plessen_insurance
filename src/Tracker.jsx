@@ -149,47 +149,82 @@ function sanitizeItem(item) {
   };
 }
 
-// Compute reimbursement. Returns { rate (total), ratePerUnit, units, source, onSchedule }
-function computeRate(rawItem, payerName, schedules, billedAmt=0) {
-  const item = sanitizeItem(rawItem);
-  const cpt  = (item.cptCode || "").toUpperCase();
+// Compute reimbursement.
+// Returns { ratePerUnit, totalReimb, billedAmt, units, source, onSchedule }
+//
+// ON SCHEDULE:
+//   ratePerUnit  = fee schedule rate (the schedule gives rate PER billing unit)
+//   totalReimb   = ratePerUnit × item.billingUnits
+//   billedAmt    = totalReimb  (billing amount must match total reimbursement)
+//
+// UNPRICED (% of billed):
+//   billedAmt    = what we charge (user-set; floor/target help guide this)
+//   totalReimb   = billedAmt × paybackPct
+//   ratePerUnit  = totalReimb / item.billingUnits
+//
+// UNPRICED (% of CMS/Medicare):
+//   ratePerUnit  = medicarerate × rule.pct
+//   totalReimb   = ratePerUnit × item.billingUnits
+//   billedAmt    = totalReimb
+function computeRate(rawItem, payerName, schedules, billedAmtParam=0) {
+  const item      = sanitizeItem(rawItem);
+  const cpt       = (item.cptCode || "").toUpperCase();
   const itemUnits = item.billingUnits || 1;
-  const mcr  = item.medicarerate || 0;
+  const mcr       = item.medicarerate || 0;
 
+  // ── Medicare ───────────────────────────────────────────────────────────────
   if (payerName === "Medicare") {
-    return { rate:mcr, ratePerUnit:+(mcr/itemUnits).toFixed(4), units:itemUnits, source:"medicare", onSchedule:true };
+    // medicarerate is already the total for 1 unit — treat as rate per unit
+    const rpu   = +(mcr).toFixed(4);
+    const total = +(rpu * itemUnits).toFixed(2);
+    return { ratePerUnit:rpu, totalReimb:total, billedAmt:total, units:itemUnits, source:"medicare", onSchedule:true };
   }
 
+  // ── On fee schedule ────────────────────────────────────────────────────────
   const sched = schedules?.[payerName];
   const entry = getSchedEntry(sched, cpt);
   if (entry && typeof entry.rate === "number") {
-    const schedUnits = Number(entry.units) || 1;
-    const totalRate  = Number(entry.rate)  || 0;
-    return { rate:totalRate, ratePerUnit:+(totalRate/schedUnits).toFixed(4), units:schedUnits, source:"schedule", onSchedule:true };
+    // Schedule rate = rate per billing unit
+    const rpu   = +(Number(entry.rate) || 0);
+    const total = +(rpu * itemUnits).toFixed(2);
+    return { ratePerUnit:rpu, totalReimb:total, billedAmt:total, units:itemUnits, source:"schedule", onSchedule:true };
   }
 
+  // ── Manual override ────────────────────────────────────────────────────────
   if (item.overrides?.[payerName] != null) {
-    const ov = Number(item.overrides[payerName]) || 0;
-    return { rate:ov, ratePerUnit:+(ov/itemUnits).toFixed(4), units:itemUnits, source:"override", onSchedule:false };
+    const rpu   = +(Number(item.overrides[payerName]) || 0);
+    const total = +(rpu * itemUnits).toFixed(2);
+    return { ratePerUnit:rpu, totalReimb:total, billedAmt:total, units:itemUnits, source:"override", onSchedule:false };
   }
 
+  // ── Unpriced rules ─────────────────────────────────────────────────────────
   const rule = UNPRICED_RULES[payerName];
-  if (!rule) return { rate:mcr, ratePerUnit:+(mcr/itemUnits).toFixed(4), units:itemUnits, source:"fallback", onSchedule:false };
+  if (!rule) {
+    const rpu = mcr;
+    return { ratePerUnit:rpu, totalReimb:+(rpu*itemUnits).toFixed(2), billedAmt:+(rpu*itemUnits).toFixed(2), units:itemUnits, source:"fallback", onSchedule:false };
+  }
 
-  if (rule.type==="pct_hawaii_cms") {
-    const r = +((mcr * rule.pct).toFixed(2));
-    return { rate:r, ratePerUnit:+(r/itemUnits).toFixed(4), units:itemUnits, source:"unpriced_cms", onSchedule:false, paybackPct:null };
+  if (rule.type === "pct_hawaii_cms" || rule.type === "pct_medicare") {
+    // Rate per unit = Medicare rate × multiplier
+    const rpu   = +((mcr * rule.pct).toFixed(4));
+    const total = +(rpu * itemUnits).toFixed(2);
+    return { ratePerUnit:rpu, totalReimb:total, billedAmt:total, units:itemUnits, source: rule.type==="pct_hawaii_cms"?"unpriced_cms":"pct_mcr", onSchedule:false, paybackPct:null };
   }
-  if (rule.type==="pct_medicare") {
-    const r = +((mcr * rule.pct).toFixed(2));
-    return { rate:r, ratePerUnit:+(r/itemUnits).toFixed(4), units:itemUnits, source:"pct_mcr", onSchedule:false, paybackPct:null };
+
+  if (rule.type === "pct_billed") {
+    // billedAmt drives everything — what we charge determines what we get back
+    const bill = Number(billedAmtParam) || 0;
+    if (bill > 0) {
+      const total = +(bill * rule.pct).toFixed(2);
+      const rpu   = +(total / itemUnits).toFixed(4);
+      return { ratePerUnit:rpu, totalReimb:total, billedAmt:bill, units:itemUnits, source:"unpriced_billed", onSchedule:false, paybackPct:rule.pct };
+    }
+    // No bill amount set yet
+    return { ratePerUnit:null, totalReimb:null, billedAmt:null, units:itemUnits, source:"unpriced_billed", onSchedule:false, paybackPct:rule.pct };
   }
-  if (rule.type==="pct_billed") {
-    const bill = Number(billedAmt) || 0;
-    const r = bill > 0 ? +((bill * rule.pct).toFixed(2)) : null;
-    return { rate:r, ratePerUnit:r!=null?+(r/itemUnits).toFixed(4):null, units:itemUnits, source:"unpriced_billed", onSchedule:false, paybackPct:rule.pct };
-  }
-  return { rate:mcr, ratePerUnit:+(mcr/itemUnits).toFixed(4), units:itemUnits, source:"fallback", onSchedule:false };
+
+  const rpu = mcr;
+  return { ratePerUnit:rpu, totalReimb:+(rpu*itemUnits).toFixed(2), billedAmt:+(rpu*itemUnits).toFixed(2), units:itemUnits, source:"fallback", onSchedule:false };
 }
 
 function downloadCSV(fn,h,r){
@@ -413,7 +448,7 @@ function SummaryBar({items,payer,schedules,targetPct}) {
   let totalReimb=0,totalCost=0,meetTarget=0;
   items.forEach(item=>{
     const res=computeRate(item,payer,schedules,item.billedAmt||0);
-    const rate=res.rate??0;
+    const rate=res.totalReimb??0;
     totalReimb+=rate; totalCost+=item.ourCost||0;
     const profit=rate-(item.ourCost||0);
     const pct=(item.ourCost||0)>0?(profit/(item.ourCost||0)*100):100;
@@ -440,20 +475,20 @@ function ItemCard({item,payerName,schedules,targetPct,onEdit,onRemove}) {
     document.addEventListener("mousedown",h);return()=>document.removeEventListener("mousedown",h);
   },[showMenu]);
 
-  const res       = computeRate(item,payerName,schedules,item.billedAmt||0);
-  const rate      = res.rate;          // total reimbursement
-  const perUnit   = res.ratePerUnit;   // rate ÷ units
-  const units     = res.units;         // units from schedule or item
-  const cost      = item.ourCost||0;
-  const billed    = item.billedAmt||0;
-  const itemUnits = item.billingUnits||1;
-  const onSched   = res.onSchedule;
-  const rule      = UNPRICED_RULES[payerName];
-  const effectiveBilled = onSched?(rate??0):billed;
-  const reimb     = rate??0;
-  const estProfit = reimb-cost;
+  const res        = computeRate(item,payerName,schedules,item.billedAmt||0);
+  const perUnit    = res.ratePerUnit;    // rate per billing unit
+  const totalReimb = res.totalReimb;     // ratePerUnit × billingUnits
+  const billedAmt  = res.billedAmt;      // what we bill (= totalReimb when on schedule)
+  const units      = res.units;
+  const cost       = item.ourCost||0;
+  const itemUnits  = item.billingUnits||1;
+  const onSched    = res.onSchedule;
+  const rule       = UNPRICED_RULES[payerName];
+  const reimb      = totalReimb??0;
+  const estProfit  = reimb-cost;
   const estProfitPct = cost>0?(estProfit/cost*100):null;
   const meetsTarget  = estProfitPct!=null?estProfitPct>=targetPct:reimb>0;
+  // For unpriced % of billed: what to charge to hit floor / target
   const floorBill  = (!onSched&&rule?.pct&&cost>0)?+(cost/rule.pct).toFixed(2):null;
   const targetBill = (!onSched&&rule?.pct&&cost>0)?+(cost*(1+targetPct/100)/rule.pct).toFixed(2):null;
   const profColor  = (p,t)=>p<0?"#c0392b":t?"#1a7040":"#1e4080";
@@ -488,7 +523,7 @@ function ItemCard({item,payerName,schedules,targetPct,onEdit,onRemove}) {
         <div className="sec-label">Cost</div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:4}}>
           <div className="card-row"><span className="card-lbl">Our Cost</span><span className="card-val">{cost>0?fmt(cost):"—"}</span></div>
-          <div className="card-row"><span className="card-lbl">Bill Amt</span><span className="card-val" style={{color:"#1e4080",fontWeight:600}}>{onSched?fmt(effectiveBilled):(billed>0?fmt(billed):<span style={{color:"#c8d8ec",fontSize:8}}>not set</span>)}</span></div>
+          <div className="card-row"><span className="card-lbl">Bill Amt</span><span className="card-val" style={{color:"#1e4080",fontWeight:600}}>{billedAmt!=null?fmt(billedAmt):<span style={{color:"#c8d8ec",fontSize:8}}>set bill amt</span>}</span></div>
           <div className="card-row"><span className="card-lbl">Bill Units</span><span className="card-val" style={{fontWeight:600}}>{itemUnits}</span></div>
         </div>
         {!onSched&&floorBill&&(
@@ -507,8 +542,8 @@ function ItemCard({item,payerName,schedules,targetPct,onEdit,onRemove}) {
         <div className="sec-label">Bill &amp; Profit</div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:4,marginBottom:6}}>
           <div className="card-row"><span className="card-lbl">Rate/Unit</span><span className="card-val" style={{fontWeight:600}}>{perUnit!=null?fmt(perUnit):"—"}</span></div>
-          <div className="card-row"><span className="card-lbl">Sched. Units</span><span className="card-val">{units}</span></div>
-          <div className="card-row"><span className="card-lbl">Total Reimb.</span><span className="card-val" style={{color:"#1e4080",fontWeight:700}}>{rate!=null?fmt(rate):<span style={{color:"#c8d8ec",fontSize:8}}>set bill amt</span>}</span></div>
+          <div className="card-row"><span className="card-lbl">Bill Units</span><span className="card-val">{itemUnits}</span></div>
+          <div className="card-row"><span className="card-lbl">Total Reimb.</span><span className="card-val" style={{color:"#1e4080",fontWeight:700}}>{totalReimb!=null?fmt(totalReimb):<span style={{color:"#c8d8ec",fontSize:8}}>set bill amt</span>}</span></div>
         </div>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
           <div style={{background:"rgba(30,64,128,.04)",borderRadius:4,padding:"5px 8px"}}>
@@ -539,9 +574,10 @@ function EditItemModal({item,payerName,schedules,targetPct,onSave,onClose}) {
   const [cost,   setCost]   = useState(item.ourCost||0);
   const [billed, setBilled] = useState(item.billedAmt||0);
   const [units,  setUnits]  = useState(item.billingUnits||1);
-  const res     = computeRate({...item,billingUnits:units},payerName,schedules,billed);
-  const rate    = res.rate;
-  const onSched = res.onSchedule;
+  const res        = computeRate({...item,billingUnits:units},payerName,schedules,billed);
+  const totalReimb = res.totalReimb;
+  const perUnit    = res.ratePerUnit;
+  const onSched    = res.onSchedule;
   const rule    = UNPRICED_RULES[payerName];
   const floorBill  = (!onSched&&rule?.pct&&cost>0)?+(cost/rule.pct).toFixed(2):null;
   const targetBill = (!onSched&&rule?.pct&&cost>0)?+(cost*(1+targetPct/100)/rule.pct).toFixed(2):null;
@@ -569,9 +605,9 @@ function EditItemModal({item,payerName,schedules,targetPct,onSave,onClose}) {
         ))}
         {onSched?(
           <div style={{marginBottom:12,background:"#f4f8fd",borderRadius:4,padding:"10px 12px"}}>
-            <div style={{fontSize:9,color:"#7a9ab8",textTransform:"uppercase",letterSpacing:".05em",marginBottom:2}}>Bill Amount</div>
-            <div style={{fontSize:14,color:"#1e4080",fontWeight:700}}>{fmt(rate)}</div>
-            <div style={{fontSize:8,color:"#7a9ab8",marginTop:2}}>Matches fee schedule — auto-set</div>
+            <div style={{fontSize:9,color:"#7a9ab8",textTransform:"uppercase",letterSpacing:".05em",marginBottom:2}}>Bill Amount (auto — matches fee schedule)</div>
+            <div style={{fontSize:14,color:"#1e4080",fontWeight:700}}>{fmt(totalReimb)}</div>
+            <div style={{fontSize:8,color:"#7a9ab8",marginTop:2}}>Rate/unit {fmt(perUnit)} × {units} unit{units!==1?"s":""} = {fmt(totalReimb)}</div>
           </div>
         ):(
           <div style={{marginBottom:12}}>
@@ -587,9 +623,9 @@ function EditItemModal({item,payerName,schedules,targetPct,onSave,onClose}) {
         )}
         <div style={{background:"#eef4fb",borderRadius:4,padding:"8px 12px",marginBottom:14,fontSize:10}}>
           <div style={{display:"flex",justifyContent:"space-between",gap:8}}>
-            <span style={{color:"#7a9ab8"}}>Rate/unit:</span><span style={{color:"#1a2d4a",fontWeight:600}}>{res.ratePerUnit!=null?fmt(res.ratePerUnit):"—"}</span>
-            <span style={{color:"#7a9ab8"}}>Total reimb:</span><span style={{color:"#1e4080",fontWeight:600}}>{rate!=null?fmt(rate):"set bill amt"}</span>
-            <span style={{color:"#7a9ab8"}}>Est. profit:</span><span style={{color:((rate??0)-cost)>=0?"#1a7040":"#c0392b",fontWeight:600}}>{fmt((rate??0)-cost)}</span>
+            <span style={{color:"#7a9ab8"}}>Rate/unit:</span><span style={{color:"#1a2d4a",fontWeight:600}}>{perUnit!=null?fmt(perUnit):"—"}</span>
+            <span style={{color:"#7a9ab8"}}>Total reimb:</span><span style={{color:"#1e4080",fontWeight:600}}>{totalReimb!=null?fmt(totalReimb):"set bill amt"}</span>
+            <span style={{color:"#7a9ab8"}}>Est. profit:</span><span style={{color:((totalReimb??0)-cost)>=0?"#1a7040":"#c0392b",fontWeight:600}}>{fmt((totalReimb??0)-cost)}</span>
           </div>
         </div>
         <div style={{display:"flex",gap:8}}>
@@ -1048,7 +1084,7 @@ function CompareModal({payers,items,schedules,targetPct,onClose}) {
             <tbody>
               {filtered.map((item,idx)=>{
                 const resA=getR(item,payerA),resB=getR(item,payerB);
-                const rA=resA.rate??0,rB=resB.rate??0;
+                const rA=resA.totalReimb??0,rB=resB.totalReimb??0;
                 const pA=rA-(item.ourCost||0),pB=rB-(item.ourCost||0);
                 const diff=rA-rB;
                 const better=diff>0?payerA:diff<0?payerB:"Tie";
@@ -1078,14 +1114,14 @@ function CompareModal({payers,items,schedules,targetPct,onClose}) {
           </table>
         </div>
         <div style={{padding:"10px 20px",background:"#e4eef8",borderTop:"2px solid #c8d8ec",display:"flex",gap:24,flexWrap:"wrap",fontSize:10,flexShrink:0}}>
-          {[payerA,payerB].map(pn=>{const tot=filtered.reduce((s,it)=>s+(getR(it,pn).rate??0),0);const totP=filtered.reduce((s,it)=>s+(getR(it,pn).rate??0)-(it.ourCost||0),0);return(
+          {[payerA,payerB].map(pn=>{const tot=filtered.reduce((s,it)=>s+(getR(it,pn).totalReimb??0),0);const totP=filtered.reduce((s,it)=>s+(getR(it,pn).totalReimb??0)-(it.ourCost||0),0);return(
             <div key={pn} style={{display:"flex",gap:14,alignItems:"center"}}>
               <span style={{color:"#7a9ab8",fontWeight:600}}>{pn}:</span>
               <span>Total: <strong style={{color:"#1e4080"}}>{fmtK(tot)}</strong></span>
               <span>Profit: <strong style={{color:totP>=0?"#1a7040":"#c0392b"}}>{fmtK(totP)}</strong></span>
             </div>
           );})}
-          <span style={{marginLeft:"auto",color:"#7a9ab8"}}>Net diff: <strong style={{color:"#1a2d4a"}}>{fmtK(filtered.reduce((s,it)=>{const rA=getR(it,payerA).rate??0,rB=getR(it,payerB).rate??0;return s+(rA-rB);},0))}</strong></span>
+          <span style={{marginLeft:"auto",color:"#7a9ab8"}}>Net diff: <strong style={{color:"#1a2d4a"}}>{fmtK(filtered.reduce((s,it)=>{const rA=getR(it,payerA).totalReimb??0,rB=getR(it,payerB).totalReimb??0;return s+(rA-rB);},0))}</strong></span>
         </div>
       </div>
     </div>
