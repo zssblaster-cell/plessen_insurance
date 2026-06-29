@@ -1,30 +1,57 @@
-import { useState, useEffect, useCallback } from "react";
-import { doc, onSnapshot, setDoc, serverTimestamp } from "firebase/firestore";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { doc, onSnapshot, setDoc, getDoc, serverTimestamp, writeBatch } from "firebase/firestore";
 import { db } from "./firebase.js";
 
-// Firestore paths (2 segments each — valid):
-//   plessen/items
-//   plessen/payers
-//   plessen/settings
-//   plessen/sched_triple_s   ← one doc per payer (avoids 1MB limit)
-//   plessen/sched_aetna
-//   plessen/sched_elan
-//   plessen/sched_uhc
-//   plessen/sched_cigna
-//   plessen/sched_medicare
-//   plessen/sched_medicaid
-//   plessen/sched_mapfre
+// ─── Constants ────────────────────────────────────────────────────────────────
+const MAX_ENTRIES_PER_CHUNK = 400;
+const MAX_BYTES_PER_CHUNK   = 700_000; // 700KB — safely under Firestore 1MB limit
 
 function clinicDoc(docId) {
   return doc(db, "plessen", docId);
 }
 
-// Map payer name → Firestore doc id
-function schedDocId(payerName) {
-  return "sched_" + payerName.toLowerCase().replace(/[\s/]+/g, "_");
+function chunkDocId(payerName, chunkIdx) {
+  return "sched_" + payerName.toLowerCase().replace(/[\s/]+/g, "_") + "_" + chunkIdx;
 }
 
-// Debounce helper
+// ─── Chunking helpers ─────────────────────────────────────────────────────────
+
+// Split a payer's schedule object into chunks respecting both limits
+function chunkSchedule(payerName, scheduleObj) {
+  const entries = Object.entries(scheduleObj);
+  const chunks  = [];
+  let current   = {};
+  let currentBytes = 0;
+
+  for (const [cpt, val] of entries) {
+    const entryBytes = JSON.stringify({ [cpt]: val }).length;
+    const wouldExceedSize    = currentBytes + entryBytes > MAX_BYTES_PER_CHUNK;
+    const wouldExceedEntries = Object.keys(current).length >= MAX_ENTRIES_PER_CHUNK;
+
+    if ((wouldExceedSize || wouldExceedEntries) && Object.keys(current).length > 0) {
+      chunks.push(current);
+      current      = {};
+      currentBytes = 0;
+    }
+
+    current[cpt]  = val;
+    currentBytes += entryBytes;
+  }
+
+  if (Object.keys(current).length > 0) chunks.push(current);
+  return chunks;
+}
+
+// Stitch chunks back into one schedule object
+function stitchChunks(chunkDataArray) {
+  const result = {};
+  for (const chunk of chunkDataArray) {
+    Object.assign(result, chunk);
+  }
+  return result;
+}
+
+// ─── Debounce helper ──────────────────────────────────────────────────────────
 function debounce(fn, ms) {
   let timer;
   return (...args) => {
@@ -89,71 +116,144 @@ export function useClinicData(docId, defaultValue) {
   return [value, setData, ready];
 }
 
-// ─── Schedules hook — one Firestore doc per payer ─────────────────────────────
-// The rest of the app sees a single `schedules` object: { "Triple S": {...}, "Aetna": {...}, ... }
-// Internally each payer's rates live in their own Firestore document to stay under the 1MB limit.
+// ─── Chunked schedules hook ───────────────────────────────────────────────────
+// Index doc:  plessen/sched_index  → { "Triple S": ["sched_triple_s_0", ...], ... }
+// Chunk docs: plessen/sched_triple_s_0 → { data: { CPT: {rate,units}, ... } }
 export function useSchedules(payerNames, initSchedules) {
-  // Combined schedules object visible to the app
-  const [schedules, setSchedulesState] = useState(initSchedules);
-  // Track readiness per payer
-  const [readySet, setReadySet] = useState(new Set());
-  const ready = readySet.size >= payerNames.length;
+  const [schedules,    setSchedulesState] = useState(initSchedules);
+  const [ready,        setReady]          = useState(false);
+  // Keep a ref to the current chunk index so we can do targeted chunk writes
+  const chunkIndexRef = useRef({});    // { payerName: ["docId0", "docId1", ...] }
+  // Keep a ref to which chunk holds which CPT: { payerName: { CPT: chunkDocId } }
+  const cptChunkMapRef = useRef({});
 
+  // ── Load: read index then fetch all chunks ──────────────────────────────────
   useEffect(() => {
-    const unsubs = payerNames.map(payerName => {
-      const docId = schedDocId(payerName);
-      const ref   = clinicDoc(docId);
-      const init  = initSchedules[payerName] || {};
+    let cancelled = false;
 
-      return onSnapshot(
-        ref,
-        (snap) => {
-          if (snap.exists()) {
-            const data = snap.data().data ?? {};
-            setSchedulesState(prev => ({ ...prev, [payerName]: data }));
-          } else {
-            // Seed with initial data for this payer
-            setDoc(ref, { data: init, updatedAt: serverTimestamp() }).catch(console.error);
-            setSchedulesState(prev => ({ ...prev, [payerName]: init }));
+    async function loadSchedules() {
+      try {
+        // 1. Read the index document
+        const idxSnap = await getDoc(clinicDoc("sched_index"));
+        let index = idxSnap.exists() ? idxSnap.data() : {};
+
+        // 2. For any payer not in the index, seed from initSchedules
+        const seedBatch = writeBatch(db);
+        let needsSeed = false;
+
+        for (const payerName of payerNames) {
+          if (!index[payerName]) {
+            const initData = initSchedules[payerName] || {};
+            const chunks   = chunkSchedule(payerName, initData);
+            const docIds   = [];
+
+            chunks.forEach((chunk, i) => {
+              const docId = chunkDocId(payerName, i);
+              docIds.push(docId);
+              seedBatch.set(clinicDoc(docId), { data: chunk, updatedAt: serverTimestamp() });
+            });
+
+            index[payerName] = docIds;
+            needsSeed = true;
           }
-          setReadySet(prev => new Set([...prev, payerName]));
-        },
-        (err) => {
-          console.error(`Firestore sched ${payerName} error:`, err);
-          setSchedulesState(prev => ({ ...prev, [payerName]: init }));
-          setReadySet(prev => new Set([...prev, payerName]));
         }
-      );
-    });
 
-    return () => unsubs.forEach(u => u());
+        if (needsSeed) {
+          // Write index + chunk docs
+          seedBatch.set(clinicDoc("sched_index"), { ...index, updatedAt: serverTimestamp() });
+          await seedBatch.commit();
+        }
+
+        if (cancelled) return;
+        chunkIndexRef.current = index;
+
+        // 3. Fetch all chunk documents in parallel
+        const merged = {};
+        const newCptMap = {};
+
+        await Promise.all(
+          payerNames.map(async (payerName) => {
+            const docIds = index[payerName] || [];
+            const chunkSnaps = await Promise.all(docIds.map(id => getDoc(clinicDoc(id))));
+            const chunkDataArray = chunkSnaps.map(s => s.exists() ? (s.data().data || {}) : {});
+            merged[payerName] = stitchChunks(chunkDataArray);
+
+            // Build CPT → chunkDocId map for targeted writes
+            newCptMap[payerName] = {};
+            chunkDataArray.forEach((chunk, i) => {
+              Object.keys(chunk).forEach(cpt => {
+                newCptMap[payerName][cpt] = docIds[i];
+              });
+            });
+          })
+        );
+
+        if (cancelled) return;
+        cptChunkMapRef.current = newCptMap;
+        setSchedulesState(merged);
+        setReady(true);
+      } catch (err) {
+        console.error("useSchedules load error:", err);
+        setSchedulesState(initSchedules);
+        setReady(true);
+      }
+    }
+
+    loadSchedules();
+    return () => { cancelled = true; };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // setSchedules: accepts full schedules object or updater function
-  // Writes only the payers that actually changed, one doc per payer
+  // ── Write: re-chunk and persist the entire payer schedule ──────────────────
+  // Used when a full payer schedule is replaced (e.g. after upload)
+  const writePayerSchedule = useCallback(async (payerName, payerData) => {
+    try {
+      const chunks   = chunkSchedule(payerName, payerData);
+      const docIds   = chunks.map((_, i) => chunkDocId(payerName, i));
+      const batch    = writeBatch(db);
+
+      // Write each chunk
+      chunks.forEach((chunk, i) => {
+        batch.set(clinicDoc(docIds[i]), { data: chunk, updatedAt: serverTimestamp() });
+      });
+
+      // Update index
+      const newIndex = { ...chunkIndexRef.current, [payerName]: docIds };
+      batch.set(clinicDoc("sched_index"), { ...newIndex, updatedAt: serverTimestamp() });
+
+      await batch.commit();
+
+      // Update refs
+      chunkIndexRef.current = newIndex;
+      const newCptMap = { ...(cptChunkMapRef.current || {}) };
+      newCptMap[payerName] = {};
+      chunks.forEach((chunk, i) => {
+        Object.keys(chunk).forEach(cpt => { newCptMap[payerName][cpt] = docIds[i]; });
+      });
+      cptChunkMapRef.current = newCptMap;
+
+      console.log(`✓ ${payerName}: wrote ${chunks.length} chunk(s), ${Object.keys(payerData).length} CPT codes`);
+    } catch (err) {
+      console.error(`writePayerSchedule ${payerName}:`, err);
+    }
+  }, []);
+
+  // ── setSchedules: called by the app to update schedules ───────────────────
   const setSchedules = useCallback((updaterOrValue) => {
     setSchedulesState(prev => {
       const next = typeof updaterOrValue === "function"
         ? updaterOrValue(prev)
         : updaterOrValue;
 
-      // Write only changed payer docs
+      // Find which payers changed and persist only those
       payerNames.forEach(payerName => {
-        const prevData = prev[payerName];
-        const nextData = next[payerName];
-        if (nextData !== prevData) {
-          const docId = schedDocId(payerName);
-          setDoc(
-            clinicDoc(docId),
-            { data: nextData || {}, updatedAt: serverTimestamp() },
-            { merge: true }
-          ).catch(err => console.error(`Firestore write sched ${payerName}:`, err));
+        if (next[payerName] !== prev[payerName]) {
+          writePayerSchedule(payerName, next[payerName] || {});
         }
       });
 
       return next;
     });
-  }, [payerNames]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [payerNames, writePayerSchedule]);
 
   return [schedules, setSchedules, ready];
 }
