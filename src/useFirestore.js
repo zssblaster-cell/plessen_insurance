@@ -1,26 +1,48 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { doc, onSnapshot, setDoc, serverTimestamp } from "firebase/firestore";
 import { db } from "./firebase.js";
 
-// ─── Firestore structure ──────────────────────────────────────────────────────
-// Collection: "plessen"  (4 chars — valid top-level collection)
-// Documents:  "items" | "payers" | "schedules" | "settings"
-// Full paths (even segments ✓):
+// Firestore paths (2 segments each — valid):
 //   plessen/items
 //   plessen/payers
 //   plessen/schedules
 //   plessen/settings
 
 function clinicDoc(docId) {
-  // doc(db, collection, document) → 2 segments = valid Firestore document ref
   return doc(db, "plessen", docId);
 }
 
-// Real-time listener for a clinic document storing { data: T }
+// Debounce helper — waits ms after last call before firing
+function debounce(fn, ms) {
+  let timer;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), ms);
+  };
+}
+
 export function useClinicData(docId, defaultValue) {
   const [value, setValue] = useState(defaultValue);
   const [ready, setReady] = useState(false);
 
+  // Debounced Firestore write — fires 800ms after last change
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const writeToFirestore = useCallback(
+    debounce(async (newValue) => {
+      try {
+        await setDoc(
+          clinicDoc(docId),
+          { data: newValue, updatedAt: serverTimestamp() },
+          { merge: true }
+        );
+      } catch (err) {
+        console.error(`Firestore write ${docId}:`, err);
+      }
+    }, 800),
+    [docId]
+  );
+
+  // Real-time listener — seeds document on first run
   useEffect(() => {
     const ref = clinicDoc(docId);
     const unsub = onSnapshot(
@@ -29,14 +51,14 @@ export function useClinicData(docId, defaultValue) {
         if (snap.exists()) {
           setValue(snap.data().data ?? defaultValue);
         } else {
-          // First run — seed the document with defaults
+          // First run — seed defaults
           setDoc(ref, { data: defaultValue, updatedAt: serverTimestamp() }).catch(console.error);
           setValue(defaultValue);
         }
         setReady(true);
       },
       (err) => {
-        console.error(`Firestore ${docId} error:`, err);
+        console.error(`Firestore ${docId} listener error:`, err);
         setValue(defaultValue);
         setReady(true);
       }
@@ -44,23 +66,21 @@ export function useClinicData(docId, defaultValue) {
     return () => unsub();
   }, [docId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const persist = async (newValue) => {
-    setValue(newValue); // optimistic update
-    try {
-      await setDoc(
-        clinicDoc(docId),
-        { data: newValue, updatedAt: serverTimestamp() },
-        { merge: true }
-      );
-    } catch (err) {
-      console.error(`Firestore write ${docId}:`, err);
-    }
-  };
+  // setData: accepts either a new value OR a functional updater (value => newValue)
+  // Mirrors React's useState setter signature exactly
+  const setData = useCallback((updaterOrValue) => {
+    setValue(prev => {
+      const next = typeof updaterOrValue === "function"
+        ? updaterOrValue(prev)
+        : updaterOrValue;
+      writeToFirestore(next);
+      return next;
+    });
+  }, [writeToFirestore]);
 
-  return [value, persist, ready];
+  return [value, setData, ready];
 }
 
-// Settings hook — flat fields (targetPct stored directly, not nested under data)
 export function useSettings() {
   const [targetPct, setTargetPctState] = useState(30);
   const [ready, setReady] = useState(false);
@@ -78,7 +98,7 @@ export function useSettings() {
     return () => unsub();
   }, []);
 
-  const setTargetPct = async (pct) => {
+  const setTargetPct = useCallback(async (pct) => {
     setTargetPctState(pct);
     try {
       await setDoc(
@@ -89,7 +109,7 @@ export function useSettings() {
     } catch (err) {
       console.error("Firestore settings write:", err);
     }
-  };
+  }, []);
 
   return [targetPct, setTargetPct, ready];
 }
