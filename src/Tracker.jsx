@@ -73,11 +73,13 @@ const INIT_SCHEDULES = {
 
 // Helper: get rate and units from a schedule entry (supports legacy number format)
 function getSchedEntry(sched, cpt) {
-  if (!sched) return null;
+  if (!sched || !cpt) return null;
   const e = sched[cpt.toUpperCase()];
   if (e == null) return null;
-  if (typeof e === "number") return { rate: e, units: 1 };
-  return { rate: e.rate ?? e, units: e.units ?? 1 };
+  if (typeof e === "number") return { rate: Number(e) || 0, units: 1 };
+  const rate = Number(e.rate ?? e) || 0;
+  const units = Number(e.units) || 1;
+  return { rate, units };
 }
 
 const DEFAULT_PAYERS = [
@@ -130,51 +132,63 @@ const DEFAULT_ITEMS = [
   { id:"em_99213",   name:"E/M 99213",        category:"Office Visit", cptCode:"99213",  ourCost:0,     medicarerate:96,    billedAmt:0, billingUnits:1, notes:"Level 3 established E/M" },
 ];
 
-const fmt  = (n) => n == null ? "—" : new Intl.NumberFormat("en-US",{style:"currency",currency:"USD",minimumFractionDigits:2}).format(n);
-const fmtK = (n) => n == null ? "—" : Math.abs(n)>=1000 ? `$${(n/1000).toFixed(1)}k` : fmt(n);
+const fmt  = (n) => (n == null || isNaN(Number(n))) ? "—" : new Intl.NumberFormat("en-US",{style:"currency",currency:"USD",minimumFractionDigits:2}).format(Number(n));
+const fmtK = (n) => (n == null || isNaN(Number(n))) ? "—" : Math.abs(Number(n))>=1000 ? `$${(Number(n)/1000).toFixed(1)}k` : fmt(n);
 
 // useLs replaced by Firestore hooks in useFirestore.js
 
+// Sanitize a single item coming from Firestore — ensure all numeric fields exist
+function sanitizeItem(item) {
+  return {
+    ...item,
+    ourCost:      Number(item.ourCost)      || 0,
+    medicarerate: Number(item.medicarerate) || 0,
+    billedAmt:    Number(item.billedAmt)    || 0,
+    billingUnits: Number(item.billingUnits) || 1,
+  };
+}
+
 // Compute reimbursement. Returns { rate (total), ratePerUnit, units, source, onSchedule }
-function computeRate(item, payerName, schedules, billedAmt=0) {
-  const cpt = item.cptCode.toUpperCase();
+function computeRate(rawItem, payerName, schedules, billedAmt=0) {
+  const item = sanitizeItem(rawItem);
+  const cpt  = (item.cptCode || "").toUpperCase();
   const itemUnits = item.billingUnits || 1;
+  const mcr  = item.medicarerate || 0;
 
   if (payerName === "Medicare") {
-    const total = item.medicarerate;
-    return { rate:total, ratePerUnit:+(total/itemUnits).toFixed(4), units:itemUnits, source:"medicare", onSchedule:true };
+    return { rate:mcr, ratePerUnit:+(mcr/itemUnits).toFixed(4), units:itemUnits, source:"medicare", onSchedule:true };
   }
 
-  const sched = schedules[payerName];
+  const sched = schedules?.[payerName];
   const entry = getSchedEntry(sched, cpt);
-  if (entry) {
-    const schedUnits = entry.units || 1;
-    const totalRate  = entry.rate;
-    const perUnit    = +(totalRate / schedUnits).toFixed(4);
-    return { rate:totalRate, ratePerUnit:perUnit, units:schedUnits, source:"schedule", onSchedule:true };
+  if (entry && typeof entry.rate === "number") {
+    const schedUnits = Number(entry.units) || 1;
+    const totalRate  = Number(entry.rate)  || 0;
+    return { rate:totalRate, ratePerUnit:+(totalRate/schedUnits).toFixed(4), units:schedUnits, source:"schedule", onSchedule:true };
   }
 
   if (item.overrides?.[payerName] != null) {
-    const ov = item.overrides[payerName];
+    const ov = Number(item.overrides[payerName]) || 0;
     return { rate:ov, ratePerUnit:+(ov/itemUnits).toFixed(4), units:itemUnits, source:"override", onSchedule:false };
   }
 
   const rule = UNPRICED_RULES[payerName];
-  if (!rule) return { rate:item.medicarerate, ratePerUnit:+(item.medicarerate/itemUnits).toFixed(4), units:itemUnits, source:"fallback", onSchedule:false };
+  if (!rule) return { rate:mcr, ratePerUnit:+(mcr/itemUnits).toFixed(4), units:itemUnits, source:"fallback", onSchedule:false };
 
   if (rule.type==="pct_hawaii_cms") {
-    const r = +(item.medicarerate*rule.pct).toFixed(2);
+    const r = +((mcr * rule.pct).toFixed(2));
     return { rate:r, ratePerUnit:+(r/itemUnits).toFixed(4), units:itemUnits, source:"unpriced_cms", onSchedule:false, paybackPct:null };
   }
   if (rule.type==="pct_medicare") {
-    const r = +(item.medicarerate*rule.pct).toFixed(2);
+    const r = +((mcr * rule.pct).toFixed(2));
     return { rate:r, ratePerUnit:+(r/itemUnits).toFixed(4), units:itemUnits, source:"pct_mcr", onSchedule:false, paybackPct:null };
   }
   if (rule.type==="pct_billed") {
-    const r = billedAmt>0 ? +(billedAmt*rule.pct).toFixed(2) : null;
+    const bill = Number(billedAmt) || 0;
+    const r = bill > 0 ? +((bill * rule.pct).toFixed(2)) : null;
     return { rate:r, ratePerUnit:r!=null?+(r/itemUnits).toFixed(4):null, units:itemUnits, source:"unpriced_billed", onSchedule:false, paybackPct:rule.pct };
   }
-  return { rate:item.medicarerate, ratePerUnit:+(item.medicarerate/itemUnits).toFixed(4), units:itemUnits, source:"fallback", onSchedule:false };
+  return { rate:mcr, ratePerUnit:+(mcr/itemUnits).toFixed(4), units:itemUnits, source:"fallback", onSchedule:false };
 }
 
 function downloadCSV(fn,h,r){
@@ -445,13 +459,13 @@ function ItemCard({item,payerName,schedules,targetPct,onEdit,onRemove}) {
           <div style={{background:"rgba(30,64,128,.04)",borderRadius:4,padding:"5px 8px"}}>
             <div style={{fontSize:7,color:"#7a9ab8",textTransform:"uppercase",fontWeight:600,marginBottom:2}}>Est. Profit</div>
             <div style={{fontSize:11,fontWeight:700,color:profColor(estProfit,meetsTarget)}}>{estProfit>=0?"+":""}{fmt(estProfit)}</div>
-            {estProfitPct!=null&&<div style={{fontSize:8,color:"#7a9ab8"}}>{estProfitPct.toFixed(0)}% on cost</div>}
+            {estProfitPct!=null&&<div style={{fontSize:8,color:"#7a9ab8"}}>{Number(estProfitPct||0).toFixed(0)}% on cost</div>}
             <div style={{fontSize:7,color:meetsTarget?"#1a7040":"#7a9ab8",marginTop:1}}>{meetsTarget?`✓ meets ${targetPct}%`:"vs drug cost"}</div>
           </div>
           <div style={{background:"rgba(26,112,64,.04)",borderRadius:4,padding:"5px 8px"}}>
             <div style={{fontSize:7,color:"#7a9ab8",textTransform:"uppercase",fontWeight:600,marginBottom:2}}>Actual Profit</div>
             <div style={{fontSize:11,fontWeight:700,color:profColor(estProfit,meetsTarget)}}>{estProfit>=0?"+":""}{fmt(estProfit)}</div>
-            {estProfitPct!=null&&<div style={{fontSize:8,color:"#7a9ab8"}}>{estProfitPct.toFixed(0)}% margin</div>}
+            {estProfitPct!=null&&<div style={{fontSize:8,color:"#7a9ab8"}}>{Number(estProfitPct||0).toFixed(0)}% margin</div>}
             <div style={{fontSize:7,color:"#7a9ab8",marginTop:1}}>reimb − cost</div>
           </div>
         </div>
@@ -729,7 +743,7 @@ function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules
                         {isEd
                           ? <input autoFocus value={editVal} onChange={e=>setEditVal(e.target.value)} onBlur={commitEdit} onKeyDown={e=>{if(e.key==="Enter")commitEdit();if(e.key==="Escape")setEditCell(null);}} style={{width:90,fontSize:12,padding:"2px 4px",border:"1px solid #3a6ab0",borderRadius:2,background:"#fff",color:"#1a2d4a",fontFamily:"inherit",outline:"none",textAlign:"right"}}/>
                           : entry!=null
-                            ? <span style={{fontSize:12,fontWeight:600,color:"#1a2d4a"}}>${entry.rate.toFixed(2)}{!py.isBase&&hasSched&&<span style={{fontSize:7,color:"#7a9ab8",marginLeft:4}}>✎</span>}</span>
+                            ? <span style={{fontSize:12,fontWeight:600,color:"#1a2d4a"}}>${Number(entry.rate||0).toFixed(2)}{!py.isBase&&hasSched&&<span style={{fontSize:7,color:"#7a9ab8",marginLeft:4}}>✎</span>}</span>
                             : <span style={{fontSize:9,color:hasSched?"#c03020":"#7a9ab8"}}>{hasSched?"★ Not listed":UNPRICED_RULES[py.name]?.label||"—"}{hasSched&&!py.isBase&&<div style={{fontSize:7,color:"#3a6ab0",cursor:"pointer"}}>+ click to add</div>}</span>
                         }
                       </td>
@@ -791,8 +805,8 @@ function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules
                         <div style={{fontSize:9,fontWeight:700,color:"#1a2d4a"}}>{py.name}</div>
                         {onSch
                           ? <>
-                              <div style={{fontSize:12,fontWeight:700,color:"#1a7040",marginTop:2}}>${entry.rate.toFixed(2)}</div>
-                              <div style={{fontSize:8,color:"#7a9ab8"}}>${perUnit?.toFixed(2)}/unit · {entry.units} unit{entry.units!==1?"s":""}</div>
+                              <div style={{fontSize:12,fontWeight:700,color:"#1a7040",marginTop:2}}>${Number(entry.rate||0).toFixed(2)}</div>
+                              <div style={{fontSize:8,color:"#7a9ab8"}}>${Number(perUnit||0).toFixed(2)}/unit · {entry.units} unit{entry.units!==1?"s":""}</div>
                             </>
                           : <div style={{fontSize:8,color:"#c03020",marginTop:2}}>★ {rule?.label||"Unpriced"}</div>
                         }
