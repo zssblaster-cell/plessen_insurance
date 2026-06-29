@@ -1,8 +1,10 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // All clinic data lives in the "plessen" collection
-    // Documents: items, payers, schedules, settings
+    // All clinic data lives in the "plessen" collection.
+    // Documents: items, payers, settings, sched_triple_s, sched_aetna,
+    //            sched_elan, sched_uhc, sched_cigna, sched_medicare,
+    //            sched_medicaid, sched_mapfre
     match /plessen/{document} {
       allow read, write: if request.auth != null;
     }

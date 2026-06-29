@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
-import { useClinicData, useSettings } from "./useFirestore.js";
+import { useClinicData, useSchedules, useSettings } from "./useFirestore.js";
+import * as XLSX from "xlsx";
 
 // ─── UNPRICED RULES ──────────────────────────────────────────────────────────
 const UNPRICED_RULES = {
@@ -198,31 +199,83 @@ function downloadCSV(fn,h,r){
 }
 
 // Simple CSV parser for uploaded fee schedules
-function parseScheduleCSV(text) {
-  const lines = text.trim().split('\n').map(l=>l.trim()).filter(Boolean);
-  if (lines.length < 2) return {};
-  const headers = lines[0].split(',').map(h=>h.replace(/"/g,'').trim().toLowerCase());
-  const codeIdx = headers.findIndex(h=>h.includes('code')||h.includes('cpt')||h.includes('proc'));
-  const rateIdx = headers.findIndex(h=>h.includes('fee')||h.includes('rate')||h.includes('reimb')||h.includes('allow'));
-  const unitIdx = headers.findIndex(h=>h.includes('unit'));
-  if (codeIdx<0||rateIdx<0) return null;
-  const result = {};
-  for (let i=1;i<lines.length;i++) {
-    const cols = lines[i].split(',').map(c=>c.replace(/"/g,'').trim());
-    const code = cols[codeIdx]?.toUpperCase();
-    const rate = parseFloat(cols[rateIdx]);
-    if (!code||isNaN(rate)) continue;
-    const units = unitIdx>=0 ? (parseInt(cols[unitIdx])||1) : 1;
-    result[code] = { rate, units };
+// Parse a spreadsheet ArrayBuffer (XLS/XLSX/CSV) using SheetJS
+// Returns { CPT: { rate, units } } or null on failure
+function parseScheduleFile(buffer) {
+  try {
+    const wb = XLSX.read(buffer, { type: "array" });
+    const result = {};
+    let totalParsed = 0;
+
+    // Try every sheet — schedules sometimes span multiple sheets or the data
+    // is on the second sheet (e.g. "Fees", "8A", "Professional", "2026")
+    for (const sheetName of wb.SheetNames) {
+      const ws = wb.Sheets[sheetName];
+      // Convert to array of arrays (raw values)
+      const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+      if (rows.length < 2) continue;
+
+      // Find the header row — scan first 15 rows for a row containing "code" or "cpt"
+      let headerRowIdx = -1;
+      let codeIdx = -1, rateIdx = -1, unitIdx = -1;
+
+      for (let r = 0; r < Math.min(15, rows.length); r++) {
+        const cells = rows[r].map(c => String(c).toLowerCase().trim());
+        const ci = cells.findIndex(c =>
+          c === "code" || c === "cpt" || c === "proc code" ||
+          c.startsWith("proc") || c.includes("hcpcs")
+        );
+        const ri = cells.findIndex(c =>
+          c.includes("fee") || c.includes("rate") || c.includes("reimb") ||
+          c.includes("allow") || c.includes("amount") || c.includes("payment")
+        );
+        if (ci >= 0 && ri >= 0) {
+          headerRowIdx = r;
+          codeIdx = ci;
+          rateIdx = ri;
+          unitIdx = cells.findIndex(c => c.includes("unit") || c.includes("qty"));
+          break;
+        }
+      }
+
+      if (headerRowIdx < 0) continue; // no header found in this sheet
+
+      // Parse data rows
+      for (let r = headerRowIdx + 1; r < rows.length; r++) {
+        const row = rows[r];
+        const rawCode = String(row[codeIdx] || "").trim().toUpperCase();
+        const rawRate = row[rateIdx];
+
+        // Skip empty or non-code rows
+        if (!rawCode || rawCode.length < 4) continue;
+        // Only accept valid CPT (5 digits) or HCPCS (letter + 4 digits) formats
+        if (!/^[A-Z0-9]{4,7}$/.test(rawCode)) continue;
+
+        const rate = parseFloat(String(rawRate).replace(/[$,\s]/g, ""));
+        if (isNaN(rate) || rate <= 0) continue;
+
+        const rawUnits = unitIdx >= 0 ? row[unitIdx] : 1;
+        const units = parseInt(String(rawUnits || "1")) || 1;
+
+        result[rawCode] = { rate: Math.round(rate * 100) / 100, units };
+        totalParsed++;
+      }
+    }
+
+    return totalParsed > 0 ? result : null;
+  } catch (err) {
+    console.error("parseScheduleFile error:", err);
+    return null;
   }
-  return result;
 }
 
 // ─── APP ROOT ─────────────────────────────────────────────────────────────────
 export default function App({ user, onSignOut }) {
   const [items,    setItems,    itemsReady]    = useClinicData("items",     DEFAULT_ITEMS);
   const [payers,   setPayers,   payersReady]   = useClinicData("payers",    DEFAULT_PAYERS);
-  const [schedules,setSchedules,schedReady]    = useClinicData("schedules", INIT_SCHEDULES);
+  // Each payer's schedule stored in its own Firestore doc to avoid 1MB limit
+  const PAYER_NAMES = DEFAULT_PAYERS.map(p => p.name);
+  const [schedules,setSchedules,schedReady]    = useSchedules(PAYER_NAMES, INIT_SCHEDULES);
   const [targetPct,setTargetPct,settingsReady]   = useSettings();
   const [selPayer, setSelPayer] = useState("Medicare");
   const [catFilter,setCatFilter]= useState("All");
@@ -494,14 +547,14 @@ function EditItemModal({item,payerName,schedules,targetPct,onSave,onClose}) {
   const handleSave=()=>{onSave(item.id,"ourCost",cost);onSave(item.id,"billedAmt",billed);onSave(item.id,"billingUnits",units);onClose();};
 
   return (
-    <div style={{position:"fixed",inset:0,background:"rgba(30,64,128,.2)",zIndex:300,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={e=>e.target===e.currentTarget&&onClose()}>
+    <div style={{position:"fixed",inset:0,background:"rgba(30,64,128,.2)",zIndex:300,display:"flex",alignItems:"center",justifyContent:"center"}} >
       <div style={{background:"#fff",border:"1px solid #c8d8ec",borderRadius:10,padding:26,width:400,maxWidth:"92vw",boxShadow:"0 8px 32px rgba(30,64,128,.18)"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:18}}>
           <div>
             <div style={{fontFamily:"'Libre Baskerville',serif",fontSize:16,color:"#1a2d4a"}}>Edit Item</div>
             <div style={{fontSize:9,color:"#7a9ab8",marginTop:2}}>{item.name} · {item.cptCode}</div>
           </div>
-          <button onClick={onClose} style={{background:"none",border:"none",fontSize:20,color:"#7a9ab8",cursor:"pointer",padding:0}}>×</button>
+          <button onClick={onClose} style={{background:"#c0392b",border:"none",borderRadius:6,color:"#fff",fontSize:16,fontWeight:700,cursor:"pointer",width:32,height:32,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,lineHeight:1}}>×</button>
         </div>
         <div style={{background:"#f4f8fd",borderRadius:6,padding:"10px 14px",marginBottom:16,fontSize:10,color:"#7a9ab8",lineHeight:1.6}}>
           Only <strong style={{color:"#1a2d4a"}}>Our Cost</strong>, <strong style={{color:"#1a2d4a"}}>Bill Amount</strong>, and <strong style={{color:"#1a2d4a"}}>Billing Units</strong> are editable here. Reimbursement rates update in <strong style={{color:"#1e4080"}}>⚙ Fee Schedule Manager</strong>.
@@ -596,27 +649,45 @@ function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules
   };
 
   const handleUpload=(e)=>{
-    const file=e.target.files?.[0];if(!file)return;
-    setUploading(true);setUploadMsg("");setUploadParsed(null);
-    const reader=new FileReader();
-    reader.onload=(ev)=>{
+    const file=e.target.files?.[0]; if(!file) return;
+    // Reset input so same file can be re-uploaded
+    e.target.value = "";
+    setUploading(true); setUploadMsg(""); setUploadParsed(null);
+    const reader = new FileReader();
+    reader.onload = (ev) => {
       try {
-        const text=ev.target.result;
-        const parsed=parseScheduleCSV(text);
-        if(parsed&&Object.keys(parsed).length>0){
-          const now=new Date().toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"2-digit"});
-          setLocalSched(prev=>({...prev,[activePyr.name]:{...(prev[activePyr.name]||{}),...parsed}}));
-          setPayers(prev=>prev.map(p=>p.id===activePyr.id?{...p,lastUpdated:now,hasSchedule:true,uploadedFile:file.name,parsedData:JSON.stringify(parsed)}:p));
+        const buffer = ev.target.result;
+        const parsed = parseScheduleFile(buffer);
+        if (parsed && Object.keys(parsed).length > 0) {
+          const now = new Date().toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"2-digit"});
+          const count = Object.keys(parsed).length;
+          // Merge into local copy (for immediate display in FSM)
+          const updatedSched = (prev) => ({...prev, [activePyr.name]: {...(prev[activePyr.name]||{}), ...parsed}});
+          setLocalSched(updatedSched);
+          // ALSO persist to Firestore immediately so main view updates too
+          setSchedules(prev => {
+            const next = {...prev, [activePyr.name]: {...(prev[activePyr.name]||{}), ...parsed}};
+            return next;
+          });
+          // Update payer metadata (lastUpdated, hasSchedule, uploadedFile)
+          setPayers(prev => prev.map(p =>
+            p.id === activePyr.id
+              ? {...p, lastUpdated:now, hasSchedule:true, uploadedFile:file.name}
+              : p
+          ));
           setUploadParsed(parsed);
-          setUploadMsg(`✓ Parsed ${Object.keys(parsed).length} CPT codes from "${file.name}"`);
-          setDirty(true);
+          setUploadMsg(`✓ Parsed and saved ${count} CPT codes from "${file.name}" — rates are now live in the tracker.`);
+          setDirty(false); // already saved to Firestore, no manual save needed
         } else {
-          setUploadMsg("⚠ Could not auto-parse this file format. Please ensure it is a CSV with Code and Fee columns, or enter rates manually in the Schedule tab.");
+          setUploadMsg(`⚠ Could not find CPT codes and rates in "${file.name}". The file may use unexpected column names. Try opening it in Excel, exporting as CSV, and uploading that instead.`);
         }
-      } catch(err){setUploadMsg("✗ Parse error: "+err.message);}
+      } catch(err) {
+        setUploadMsg("✗ Parse error: " + err.message);
+      }
       setUploading(false);
     };
-    reader.readAsText(file);
+    // Read as ArrayBuffer so SheetJS can handle XLS, XLSX, and CSV
+    reader.readAsArrayBuffer(file);
   };
 
   const downloadAllCSV=()=>{
@@ -655,7 +726,7 @@ function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules
           {dirty&&<button onClick={saveEdits} style={{padding:"5px 12px",borderRadius:4,border:"1px solid #7fd0a8",background:"rgba(100,200,140,.2)",color:"#7fd0a8",fontSize:10,cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>Save Edits</button>}
           <button onClick={()=>setCompareOpen(true)} style={{padding:"5px 12px",borderRadius:4,border:"1px solid rgba(255,255,255,.3)",background:"rgba(255,255,255,.12)",color:"#fff",fontSize:10,cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>⊞ Compare</button>
           <button onClick={downloadAllCSV} style={{padding:"5px 12px",borderRadius:4,border:"1px solid rgba(255,255,255,.3)",background:"rgba(255,255,255,.1)",color:"#fff",fontSize:10,cursor:"pointer",fontFamily:"inherit"}}>⬇️ Download All</button>
-          <button onClick={onClose} style={{background:"rgba(255,255,255,.1)",border:"1px solid rgba(255,255,255,.2)",borderRadius:6,color:"#fff",fontSize:18,cursor:"pointer",width:32,height:32,display:"flex",alignItems:"center",justifyContent:"center"}}>×</button>
+          <button onClick={onClose} style={{background:"#c0392b",border:"none",borderRadius:6,color:"#fff",fontSize:16,fontWeight:700,cursor:"pointer",width:32,height:32,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,lineHeight:1}}>×</button>
         </div>
       </div>
 
@@ -870,7 +941,7 @@ function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules
       {compareOpen&&<CompareModal payers={payers} items={items} schedules={localSched} targetPct={30} onClose={()=>setCompareOpen(false)}/>}
 
       {/* View Parsed modal */}
-      {viewParsed&&<ViewParsedModal payer={viewParsed} schedule={localSched[viewParsed.name]||{}} items={items} onClose={()=>setViewParsed(null)}/>}
+      {viewParsed&&<ViewParsedModal payer={viewParsed} schedule={schedules[viewParsed.name]||localSched[viewParsed.name]||{}} items={items} onClose={()=>setViewParsed(null)}/>}
     </div>
   );
 }
@@ -880,14 +951,14 @@ function ViewParsedModal({payer,schedule,items,onClose}) {
   const cptInfo={}; items.forEach(i=>{cptInfo[i.cptCode.toUpperCase()]=i;});
   const entries=Object.entries(schedule).sort((a,b)=>a[0].localeCompare(b[0]));
   return (
-    <div style={{position:"fixed",inset:0,background:"rgba(30,64,128,.3)",zIndex:600,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={e=>e.target===e.currentTarget&&onClose()}>
+    <div style={{position:"fixed",inset:0,background:"rgba(30,64,128,.3)",zIndex:600,display:"flex",alignItems:"center",justifyContent:"center"}} >
       <div style={{background:"#fff",borderRadius:10,boxShadow:"0 12px 48px rgba(30,64,128,.2)",width:"80vw",maxWidth:700,maxHeight:"85vh",display:"flex",flexDirection:"column",overflow:"hidden"}}>
         <div style={{background:"linear-gradient(135deg,#1a3a6a,#1e4080)",padding:"12px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>
           <div>
             <div style={{fontFamily:"'Libre Baskerville',serif",fontSize:16,color:"#fff"}}>👁 Parsed Schedule — {payer.name}</div>
             <div style={{fontSize:8,color:"rgba(255,255,255,.6)",marginTop:2}}>View only · {entries.length} codes loaded · Last updated: {payer.lastUpdated||"—"}</div>
           </div>
-          <button onClick={onClose} style={{background:"rgba(255,255,255,.1)",border:"1px solid rgba(255,255,255,.2)",borderRadius:6,color:"#fff",fontSize:18,cursor:"pointer",width:32,height:32,display:"flex",alignItems:"center",justifyContent:"center"}}>×</button>
+          <button onClick={onClose} style={{background:"#c0392b",border:"none",borderRadius:6,color:"#fff",fontSize:16,fontWeight:700,cursor:"pointer",width:32,height:32,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,lineHeight:1}}>×</button>
         </div>
         {payer.uploadedFile&&<div style={{background:"#f4f8fd",padding:"8px 20px",fontSize:9,color:"#7a9ab8",borderBottom:"1px solid #dce8f4",flexShrink:0}}>📁 Source file: <strong style={{color:"#1a2d4a"}}>{payer.uploadedFile}</strong></div>}
         <div style={{flex:1,overflowY:"auto"}}>
@@ -933,11 +1004,11 @@ function CompareModal({payers,items,schedules,targetPct,onClose}) {
   const filtered=cat==="All"?items:items.filter(i=>i.category===cat);
   const getR=(item,pn)=>computeRate(item,pn,schedules,item.billedAmt||0);
   return (
-    <div style={{position:"fixed",inset:0,background:"rgba(30,64,128,.35)",zIndex:550,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={e=>e.target===e.currentTarget&&onClose()}>
+    <div style={{position:"fixed",inset:0,background:"rgba(30,64,128,.35)",zIndex:550,display:"flex",alignItems:"center",justifyContent:"center"}} >
       <div style={{background:"#fff",borderRadius:10,boxShadow:"0 12px 48px rgba(30,64,128,.2)",width:"92vw",maxWidth:960,maxHeight:"90vh",display:"flex",flexDirection:"column",overflow:"hidden"}}>
         <div style={{background:"linear-gradient(135deg,#1a3a6a,#1e4080)",padding:"13px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>
           <div style={{fontFamily:"'Libre Baskerville',serif",fontSize:17,color:"#fff"}}>⊞ Compare Insurance Rates</div>
-          <button onClick={onClose} style={{background:"rgba(255,255,255,.1)",border:"1px solid rgba(255,255,255,.2)",borderRadius:6,color:"#fff",fontSize:18,cursor:"pointer",width:32,height:32,display:"flex",alignItems:"center",justifyContent:"center"}}>×</button>
+          <button onClick={onClose} style={{background:"#c0392b",border:"none",borderRadius:6,color:"#fff",fontSize:16,fontWeight:700,cursor:"pointer",width:32,height:32,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,lineHeight:1}}>×</button>
         </div>
         <div style={{padding:"10px 20px",background:"#f8fafd",borderBottom:"1px solid #dce8f4",display:"flex",gap:12,alignItems:"center",flexWrap:"wrap",flexShrink:0}}>
           {[["Payer A",payerA,setPayerA,"#1e4080"],["Payer B",payerB,setPayerB,"#3a6ab0"]].map(([lbl,val,setVal,bc])=>(
