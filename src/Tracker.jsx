@@ -172,22 +172,21 @@ function computeRate(rawItem, payerName, schedules, billedAmtParam=0) {
   const itemUnits = item.billingUnits || 1;
   const mcr       = item.medicarerate || 0;
 
-  // ── Medicare ───────────────────────────────────────────────────────────────
-  if (payerName === "Medicare") {
-    // medicarerate is already the total for 1 unit — treat as rate per unit
-    const rpu   = +(mcr).toFixed(4);
-    const total = +(rpu * itemUnits).toFixed(2);
-    return { ratePerUnit:rpu, totalReimb:total, billedAmt:total, units:itemUnits, source:"medicare", onSchedule:true };
-  }
-
-  // ── On fee schedule ────────────────────────────────────────────────────────
+  // ── Check uploaded schedule first (applies to ALL payers including Medicare) ─
+  // If a fee schedule has been uploaded for this payer, it takes priority
   const sched = schedules?.[payerName];
   const entry = getSchedEntry(sched, cpt);
   if (entry && typeof entry.rate === "number") {
-    // Schedule rate = rate per billing unit
     const rpu   = +(Number(entry.rate) || 0);
     const total = +(rpu * itemUnits).toFixed(2);
     return { ratePerUnit:rpu, totalReimb:total, billedAmt:total, units:itemUnits, source:"schedule", onSchedule:true };
+  }
+
+  // ── Medicare fallback — use medicarerate on item if no schedule uploaded ────
+  if (payerName === "Medicare") {
+    const rpu   = +mcr.toFixed(4);
+    const total = +(rpu * itemUnits).toFixed(2);
+    return { ratePerUnit:rpu, totalReimb:total, billedAmt:total, units:itemUnits, source:"medicare", onSchedule:false };
   }
 
   // ── Manual override ────────────────────────────────────────────────────────
