@@ -204,8 +204,10 @@ function computeRate(rawItem, payerName, schedules, billedAmtParam=0) {
   }
 
   if (rule.type === "pct_hawaii_cms" || rule.type === "pct_medicare") {
-    // Rate per unit = Medicare rate × multiplier
-    const rpu   = +((mcr * rule.pct).toFixed(4));
+    // Use the LIVE Medicare rate (from uploaded schedule if present, else fallback)
+    // so Medicaid/Triple S/ELAN always derive from whatever Medicare actually resolves to
+    const liveMcr = computeRate(rawItem, "Medicare", schedules, billedAmtParam).ratePerUnit ?? mcr;
+    const rpu   = +((liveMcr * rule.pct).toFixed(4));
     const total = +(rpu * itemUnits).toFixed(2);
     return { ratePerUnit:rpu, totalReimb:total, billedAmt:total, units:itemUnits, source: rule.type==="pct_hawaii_cms"?"unpriced_cms":"pct_mcr", onSchedule:false, paybackPct:null };
   }
@@ -421,7 +423,7 @@ export default function App({ user, onSignOut }) {
         })}
       </div>
 
-      {showSettings&&<FeeScheduleManager payers={payers} setPayers={setPayers} items={items} addItem={addItem} removeItem={removeItem} schedules={schedules} setSchedules={setSchedules} loadFullSchedule={loadFullSchedule} writeFullUpload={writeFullUpload} onClose={()=>setShowSettings(false)}/>}
+      {showSettings&&<FeeScheduleManager payers={payers} setPayers={setPayers} items={items} addItem={addItem} updateItem={updateItem} removeItem={removeItem} schedules={schedules} setSchedules={setSchedules} loadFullSchedule={loadFullSchedule} writeFullUpload={writeFullUpload} onClose={()=>setShowSettings(false)}/>}
       {editItem&&<EditItemModal item={editItem} payerName={selPayer} schedules={schedules} targetPct={targetPct} onSave={(id,f,v)=>updateItem(id,f,v)} onClose={()=>setEditItem(null)}/>}
     </div>
   );
@@ -638,7 +640,7 @@ function EditItemModal({item,payerName,schedules,targetPct,onSave,onClose}) {
 }
 
 // ─── FEE SCHEDULE MANAGER ────────────────────────────────────────────────────
-function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules,setSchedules,loadFullSchedule,writeFullUpload,onClose}) {
+function FeeScheduleManager({payers,setPayers,items,addItem,updateItem,removeItem,schedules,setSchedules,loadFullSchedule,writeFullUpload,onClose}) {
   const [tab,       setTab]        = useState("schedules");
   const [activePyr, setActivePyr]  = useState(payers.find(p=>p.hasSchedule)||payers[0]);
   const [search,    setSearch]     = useState("");
@@ -667,18 +669,48 @@ function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules
     return true;
   }).sort((a,b)=>{const ca=cptInfo[a]?.category||"ZZZ",cb=cptInfo[b]?.category||"ZZZ";return ca.localeCompare(cb)||(cptInfo[a]?.name||a).localeCompare(cptInfo[b]?.name||b);});
 
-  const startEdit=(pn,cpt)=>{setEditCell({pn,cpt});const e=getSchedEntry(localSched[pn],cpt);setEditVal(e?e.rate:"");};
+  const startEdit=(pn,cpt)=>{
+    setEditCell({pn,cpt});
+    const item = cptInfo[cpt];
+    const py = payers.find(p=>p.name===pn);
+    if (py?.isBase) {
+      // Medicare — edit the item's medicarerate field if no schedule entry exists
+      const e = getSchedEntry(localSched[pn], cpt);
+      setEditVal(e ? e.rate : (item?.medicarerate ?? ""));
+    } else {
+      const e = getSchedEntry(localSched[pn], cpt);
+      setEditVal(e ? e.rate : "");
+    }
+  };
   const commitEdit=()=>{
     if(!editCell)return;
     const v=parseFloat(editVal);
+    const py = payers.find(p=>p.name===editCell.pn);
+    const item = cptInfo[editCell.cpt];
+
+    if (py?.isBase) {
+      // Medicare: write directly to item.medicarerate so it takes effect immediately
+      // across the whole app (tracker cards, Medicaid's 100% rule, etc.)
+      if (!isNaN(v) && v > 0 && item) {
+        updateItem(item.id, "medicarerate", v);
+      }
+      setEditCell(null);
+      return;
+    }
+
+    // Non-Medicare: update localSched AND push to Firestore immediately
     setLocalSched(prev=>{
       const next={...prev,[editCell.pn]:{...(prev[editCell.pn]||{})}};
       const existing=getSchedEntry(prev[editCell.pn],editCell.cpt);
       if(!isNaN(v)&&v>0) next[editCell.pn][editCell.cpt]={rate:v,units:existing?.units||1};
       else delete next[editCell.pn][editCell.cpt];
+
+      // Write immediately to Firestore — no need to wait for "Save Edits"
+      setSchedules(schedPrev => ({...schedPrev, [editCell.pn]: next[editCell.pn]}));
+
       return next;
     });
-    setDirty(true);setEditCell(null);
+    setEditCell(null);
   };
   const saveEdits=()=>{setSchedules(localSched);setDirty(false);};
 
@@ -759,8 +791,7 @@ function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules
           </div>
         </div>
         <div style={{display:"flex",gap:8,alignItems:"center"}}>
-          {dirty&&<span style={{fontSize:9,color:"#ffd080",background:"rgba(255,200,0,.15)",padding:"3px 8px",borderRadius:4}}>● Unsaved edits</span>}
-          {dirty&&<button onClick={saveEdits} style={{padding:"5px 12px",borderRadius:4,border:"1px solid #7fd0a8",background:"rgba(100,200,140,.2)",color:"#7fd0a8",fontSize:10,cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>Save Edits</button>}
+          <span style={{fontSize:9,color:"#7fd0a8",background:"rgba(100,200,140,.15)",padding:"3px 8px",borderRadius:4}}>✓ Edits save instantly</span>
           <button onClick={()=>setCompareOpen(true)} style={{padding:"5px 12px",borderRadius:4,border:"1px solid rgba(255,255,255,.3)",background:"rgba(255,255,255,.12)",color:"#fff",fontSize:10,cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>⊞ Compare</button>
           <button onClick={downloadAllCSV} style={{padding:"5px 12px",borderRadius:4,border:"1px solid rgba(255,255,255,.3)",background:"rgba(255,255,255,.1)",color:"#fff",fontSize:10,cursor:"pointer",fontFamily:"inherit"}}>⬇️ Download All</button>
           <button onClick={onClose} style={{background:"#c0392b",border:"none",borderRadius:6,color:"#fff",fontSize:16,fontWeight:700,cursor:"pointer",width:32,height:32,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,lineHeight:1}}>×</button>
@@ -832,9 +863,9 @@ function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules
                   const item=cptInfo[cpt];
                   const py=activePyr;if(!py)return null;
                   const hasSched=py.isBase||!!localSched[py.name];
-                  const entry=py.isBase?{rate:item?.medicarerate,units:item?.billingUnits||1}:getSchedEntry(localSched[py.name],cpt);
+                  const entry=getSchedEntry(localSched[py.name],cpt) ?? (py.isBase&&item ? {rate:item.medicarerate,units:item.billingUnits||1} : null);
                   const isEd=editCell?.pn===py.name&&editCell?.cpt===cpt;
-                  const onSch=py.isBase?true:(hasSched&&entry!=null);
+                  const onSch=entry!=null;
                   const perUnit=entry?+(entry.rate/(entry.units||1)).toFixed(4):null;
                   const schedUnits=entry?.units||1;
                   const itemBillUnits=item?.billingUnits||1;
@@ -845,20 +876,20 @@ function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules
                       </td>
                       <td style={{...TD,fontSize:10,color:"#7a9ab8",fontStyle:"italic"}}>{cpt}</td>
                       <td style={{...TD}}>{item?.category?<span className={`cbadge c-${item.category.replace(/ /g,"_")}`}>{item.category}</span>:<span style={{color:"#c8d8ec"}}>—</span>}</td>
-                      {/* Rate cell — editable */}
-                      <td style={{...TD,textAlign:"right",borderLeft:"2px solid #c8d8ec",cursor:(!py.isBase&&hasSched)?"text":"default",background:!onSch&&hasSched?"rgba(200,80,0,.03)":"rgba(30,64,128,.02)"}}
-                        onClick={()=>!py.isBase&&hasSched&&startEdit(py.name,cpt)}>
+                      {/* Rate cell — always editable, including Medicare and unpriced codes */}
+                      <td style={{...TD,textAlign:"right",borderLeft:"2px solid #c8d8ec",cursor:"text",background:!onSch?"rgba(200,80,0,.03)":"rgba(30,64,128,.02)"}}
+                        onClick={()=>startEdit(py.name,cpt)}>
                         {isEd
                           ? <input autoFocus value={editVal} onChange={e=>setEditVal(e.target.value)} onBlur={commitEdit} onKeyDown={e=>{if(e.key==="Enter")commitEdit();if(e.key==="Escape")setEditCell(null);}} style={{width:90,fontSize:12,padding:"2px 4px",border:"1px solid #3a6ab0",borderRadius:2,background:"#fff",color:"#1a2d4a",fontFamily:"inherit",outline:"none",textAlign:"right"}}/>
                           : entry!=null
-                            ? <span style={{fontSize:12,fontWeight:600,color:"#1a2d4a"}}>${Number(entry.rate||0).toFixed(2)}{!py.isBase&&hasSched&&<span style={{fontSize:7,color:"#7a9ab8",marginLeft:4}}>✎</span>}</span>
-                            : <span style={{fontSize:9,color:hasSched?"#c03020":"#7a9ab8"}}>{hasSched?"★ Not listed":UNPRICED_RULES[py.name]?.label||"—"}{hasSched&&!py.isBase&&<div style={{fontSize:7,color:"#3a6ab0",cursor:"pointer"}}>+ click to add</div>}</span>
+                            ? <span style={{fontSize:12,fontWeight:600,color:"#1a2d4a"}}>${Number(entry.rate||0).toFixed(2)}<span style={{fontSize:7,color:"#7a9ab8",marginLeft:4}}>✎</span></span>
+                            : <span style={{fontSize:9,color:"#c03020"}}>{py.isBase?"Not set":UNPRICED_RULES[py.name]?.label||"—"}<div style={{fontSize:7,color:"#3a6ab0",cursor:"pointer"}}>+ click to add</div></span>
                         }
                       </td>
                       <td style={{...TD,textAlign:"right",fontSize:10,color:"#3a6ab0"}}>{perUnit!=null?`$${perUnit.toFixed(2)}`:"—"}</td>
                       <td style={{...TD,textAlign:"center",fontSize:10,color:"#1a2d4a",fontWeight:500}}>{schedUnits}</td>
                       <td style={{...TD,textAlign:"center",fontSize:10,color:"#1a2d4a"}}>{itemBillUnits}</td>
-                      <td style={{...TD,textAlign:"center"}}>{py.isBase?<span style={{fontSize:9,color:"#1e4080"}}>CMS</span>:onSch?<span style={{fontSize:12,color:"#1a7040"}}>✓</span>:<span style={{fontSize:12,color:"#c03020"}}>★</span>}</td>
+                      <td style={{...TD,textAlign:"center"}}>{onSch?<span style={{fontSize:12,color:"#1a7040"}}>✓</span>:<span style={{fontSize:12,color:"#c03020"}}>★</span>}</td>
                     </tr>
                   );
                 })}
@@ -870,7 +901,7 @@ function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules
             <span><span style={{color:"#1a7040"}}>✓</span> On schedule</span>
             <span><span style={{color:"#c03020"}}>★</span> Unpriced — rule applies</span>
             <span>Rate/Unit = Total Rate ÷ Schedule Units</span>
-            {dirty&&<span style={{color:"#a07000"}}>● Click "Save Edits" to apply</span>}
+            <span style={{color:"#7fd0a8"}}>✓ All rate edits apply instantly — no save needed</span>
           </div>
         </>
       )}
@@ -969,7 +1000,7 @@ function FeeScheduleManager({payers,setPayers,items,addItem,removeItem,schedules
                 {uploadParsed&&<div style={{marginTop:6}}><button onClick={()=>setViewParsed(activePyr)} style={{padding:"4px 12px",borderRadius:3,border:"1px solid #1e4080",background:"rgba(30,64,128,.08)",color:"#1e4080",fontSize:9,cursor:"pointer",fontFamily:"inherit"}}>👁 View Parsed Data</button></div>}
               </div>
             )}
-            {dirty&&<div style={{marginTop:10,background:"rgba(232,160,32,.08)",border:"1px solid rgba(232,160,32,.3)",borderRadius:4,padding:"8px 12px",fontSize:9,color:"#a07000"}}>● Don't forget to click <strong>Save Edits</strong> in the Schedule tab to apply uploaded rates.</div>}
+
           </div>
         </div>
       )}
